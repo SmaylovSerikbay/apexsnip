@@ -56,7 +56,20 @@ const (
 	simTradeFeeBuyUSD     = 0.015 // ~priority fee, диапазон $0.01–0.02
 	simTradeFeeSellUSD    = 0.015
 	simExperimentDuration   = 60 * time.Minute
-	simPortfolioLogEvery  = 5 * time.Minute
+	simPortfolioLogEvery  = 30 * time.Second
+)
+
+// Pump create (IDL): аккаунт «user» (плательщик/создатель сделки) и минимум SOL на кошельке для anti-rug.
+const (
+	pumpCreateUserAccountIndex = 7 // accounts[7] = user (signer)
+	pumpMinCreatorLamports     = uint64(100_000_000) // 0.1 SOL
+)
+
+// ANSI для зелёного баннера [TRADING] в терминале.
+const (
+	ansiGreen = "\x1b[32m"
+	ansiBold  = "\x1b[1m"
+	ansiReset = "\x1b[0m"
 )
 
 // BUY_LAMPORTS — размер «покупки» в лампортах (0.05 SOL по умолчанию).
@@ -675,6 +688,11 @@ func reportSimulationBuy(mint string, entryUSD float64) bool {
 
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
 	sol := float64(BUY_LAMPORTS) / 1e9
+	wide := strings.Repeat("═", 58)
+	gb := ansiGreen + ansiBold
+	fmt.Printf("\n%s%s%s\n", gb, wide, ansiReset)
+	fmt.Printf("%s🟢 [TRADING] Bought %s for $1.00.%s\n", gb, mint, ansiReset)
+	fmt.Printf("%s%s%s\n\n", gb, wide, ansiReset)
 	fmt.Println(bannerSep)
 	fmt.Printf("🟢 SIMULATION BUY: %s at %s | ставка $%.2f + fee $%.2f | cash после $%.2f | entry_usd=%.10f\n",
 		mint, ts, simBetUSD, simTradeFeeBuyUSD, cashAfter, entryUSD)
@@ -731,7 +749,7 @@ func reportSimulationSell(mint, reason string, entry, exit float64) {
 		ts, mint, reason, entry, exit, pnlPct, simTradeFeeSellUSD, cashLine))
 }
 
-func simulationMarkToMarketOpen(ctx context.Context) (cash float64, mtm float64, nOpen int) {
+func simulationMarkToMarketOpen(ctx context.Context) (cash float64, mtm float64, nOpen int, openPnl []string) {
 	simMu.Lock()
 	cash = simCashUSD
 	type pair struct {
@@ -748,17 +766,27 @@ func simulationMarkToMarketOpen(ctx context.Context) (cash float64, mtm float64,
 	for _, it := range list {
 		select {
 		case <-ctx.Done():
-			return cash, mtm, nOpen
+			return cash, mtm, nOpen, openPnl
 		default:
 		}
 		p, err := fetchJupiterPriceUSD(it.m)
 		if err != nil || it.ent <= 0 {
 			mtm += simBetUSD
+			openPnl = append(openPnl, fmt.Sprintf("[%s: n/a]", shortMint(it.m)))
 			continue
 		}
 		mtm += simBetUSD * (p / it.ent)
+		pct := (p/it.ent - 1) * 100
+		openPnl = append(openPnl, fmt.Sprintf("[%s: %.2f%%]", shortMint(it.m), pct))
 	}
-	return cash, mtm, nOpen
+	return cash, mtm, nOpen, openPnl
+}
+
+func shortMint(m string) string {
+	if len(m) <= 8 {
+		return m
+	}
+	return m[:8]
 }
 
 func simulationPortfolioLogLoop(ctx context.Context) {
@@ -769,13 +797,17 @@ func simulationPortfolioLogLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			cash, mtm, n := simulationMarkToMarketOpen(context.Background())
+			cash, mtm, n, pnlList := simulationMarkToMarketOpen(context.Background())
 			total := cash + mtm
 			ts := time.Now().UTC().Format(time.RFC3339Nano)
-			fmt.Printf("[SIM Portfolio] %s | cash=$%.2f | открытые (MTM)=$%.2f | всего=$%.2f | позиций=%d\n",
-				ts, cash, mtm, total, n)
-			appendSnipeLog(fmt.Sprintf("%s | PORTFOLIO | cash_usd=%.4f | open_mtm_usd=%.4f | total_usd=%.4f | open_n=%d",
-				ts, cash, mtm, total, n))
+			openLine := "-"
+			if len(pnlList) > 0 {
+				openLine = strings.Join(pnlList, " ")
+			}
+			fmt.Printf("[SIM Portfolio] %s | cash=$%.2f | открытые (MTM)=$%.2f | всего=$%.2f | позиций=%d | open_pnl=%s\n",
+				ts, cash, mtm, total, n, openLine)
+			appendSnipeLog(fmt.Sprintf("%s | PORTFOLIO | cash_usd=%.4f | open_mtm_usd=%.4f | total_usd=%.4f | open_n=%d | open_pnl=%s",
+				ts, cash, mtm, total, n, openLine))
 		}
 	}
 }
@@ -790,7 +822,7 @@ func simulationExperimentTimer(ctx context.Context) {
 }
 
 func printFinalSimulationReport() {
-	cash, mtm, nOpen := simulationMarkToMarketOpen(context.Background())
+	cash, mtm, nOpen, _ := simulationMarkToMarketOpen(context.Background())
 	total := cash + mtm
 	fmt.Println(bannerSep)
 	fmt.Println("SIM EXPERIMENT — финальный отчёт (60 мин)")
@@ -946,7 +978,7 @@ func handleRaydiumLogNotification(ctx context.Context, rpcClient *rpc.Client, wa
 
 	targetMint := pickNonBaseQuoteMint(init.CoinMint, init.PcMint)
 
-	if ok, why := passesMintSecurity(ctx, rpcClient, targetMint); !ok {
+	if ok, why := passesMintSecurity(ctx, rpcClient, targetMint, solana.PublicKey{}); !ok {
 		logRejected(targetMint.String(), fmt.Sprintf("risk-check: %s", why))
 		return
 	}
@@ -1018,13 +1050,13 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 		return
 	}
 	keys := fullAccountKeys(tx.Message.AccountKeys, out.Meta)
-	mint, ok := findPumpCreateMintInTransaction(tx, out.Meta, keys)
+	mint, pumpDev, ok := findPumpCreateMintAndUserInTransaction(tx, out.Meta, keys)
 	if !ok {
 		logRejected("", fmt.Sprintf("[PUMP] no create ix sig=%s", sigStr))
 		return
 	}
 
-	if ok, why := passesMintSecurity(ctx, rpcClient, mint); !ok {
+	if ok, why := passesMintSecurity(ctx, rpcClient, mint, pumpDev); !ok {
 		logRejected(mint.String(), fmt.Sprintf("[PUMP] risk-check: %s", why))
 		return
 	}
@@ -1072,7 +1104,7 @@ func handleCPMMInitializeNotification(ctx context.Context, rpcClient *rpc.Client
 	}
 	targetMint := pickNonBaseQuoteMint(t0, t1)
 
-	if ok, why := passesMintSecurity(ctx, rpcClient, targetMint); !ok {
+	if ok, why := passesMintSecurity(ctx, rpcClient, targetMint, solana.PublicKey{}); !ok {
 		logRejected(targetMint.String(), fmt.Sprintf("[CPMM] risk-check: %s", why))
 		return
 	}
@@ -1155,7 +1187,45 @@ func findInitialize2InTransaction(tx *solana.Transaction, meta *rpc.TransactionM
 
 // findPumpCreateMintInTransaction — Pump IDL: create, accounts[0] = mint (signer).
 func findPumpCreateMintInTransaction(tx *solana.Transaction, meta *rpc.TransactionMeta, keys solana.PublicKeySlice) (solana.PublicKey, bool) {
-	return findAnchorIxMintAtAccountIndex(pumpFunProgram, pumpCreateDisc, tx, meta, keys, 0)
+	m, _, ok := findPumpCreateMintAndUserInTransaction(tx, meta, keys)
+	return m, ok
+}
+
+// findPumpCreateMintAndUserInTransaction — create: mint @0, user (dev) @7 по публичному IDL Pump.
+func findPumpCreateMintAndUserInTransaction(tx *solana.Transaction, meta *rpc.TransactionMeta, keys solana.PublicKeySlice) (mint solana.PublicKey, user solana.PublicKey, ok bool) {
+	if meta == nil {
+		return solana.PublicKey{}, solana.PublicKey{}, false
+	}
+	inspect := func(programIDIndex uint16, accounts []uint16, data []byte) (solana.PublicKey, solana.PublicKey, bool) {
+		if int(programIDIndex) >= len(keys) || !keys[programIDIndex].Equals(pumpFunProgram) {
+			return solana.PublicKey{}, solana.PublicKey{}, false
+		}
+		if len(data) < 8 || !bytes.Equal(data[:8], pumpCreateDisc) {
+			return solana.PublicKey{}, solana.PublicKey{}, false
+		}
+		if len(accounts) <= pumpCreateUserAccountIndex {
+			return solana.PublicKey{}, solana.PublicKey{}, false
+		}
+		mi := accounts[0]
+		ui := accounts[pumpCreateUserAccountIndex]
+		if int(mi) >= len(keys) || int(ui) >= len(keys) {
+			return solana.PublicKey{}, solana.PublicKey{}, false
+		}
+		return keys[mi], keys[ui], true
+	}
+	for _, ci := range tx.Message.Instructions {
+		if m, u, o := inspect(ci.ProgramIDIndex, ci.Accounts, []byte(ci.Data)); o {
+			return m, u, true
+		}
+	}
+	for _, block := range meta.InnerInstructions {
+		for _, ci := range block.Instructions {
+			if m, u, o := inspect(ci.ProgramIDIndex, ci.Accounts, []byte(ci.Data)); o {
+				return m, u, true
+			}
+		}
+	}
+	return solana.PublicKey{}, solana.PublicKey{}, false
 }
 
 // findCPMMInitializeMintsInTransaction — raydium_cp_swap IDL initialize: token_0_mint / token_1_mint @ индексы 4 и 5.
@@ -1259,14 +1329,35 @@ func pickNonBaseQuoteMint(coin, pc solana.PublicKey) solana.PublicKey {
 
 // ---------- 3) Rug-check: Mint account (mint authority & freeze authority) ----------
 
-// passesMintSecurity возвращает true, если mint authority и freeze authority выключены (COption = None).
-func passesMintSecurity(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
-	const maxAttempts = 5
+// passesMintSecurity — mint authority/freeze + опционально ≥0.1 SOL у pumpDev (создатель create).
+// pumpDev = zero pubkey → проверка создателя не выполняется (Raydium / CPMM).
+// Новые mint: GetAccountInfo с commitment=processed, 10×500ms ≈ 5s ожидания индексации.
+func passesMintSecurity(ctx context.Context, c *rpc.Client, mint solana.PublicKey, pumpDev solana.PublicKey) (bool, string) {
+	var zero solana.PublicKey
+	if !pumpDev.Equals(zero) {
+		bal, err := c.GetBalance(ctx, pumpDev, rpc.CommitmentProcessed)
+		if err != nil {
+			return false, fmt.Sprintf("creator getBalance failed: %v", err)
+		}
+		if bal == nil {
+			return false, "creator getBalance: empty response"
+		}
+		if bal.Value < pumpMinCreatorLamports {
+			return false, fmt.Sprintf("creator SOL < 0.1 (have %.4f SOL)", float64(bal.Value)/1e9)
+		}
+	}
+
+	const maxAttempts = 10
+	const retryDelay = 500 * time.Millisecond
+	mintInfoOpts := &rpc.GetAccountInfoOpts{
+		Encoding:   solana.EncodingBase64,
+		Commitment: rpc.CommitmentProcessed,
+	}
 	mintAccountMissing := func(acc *rpc.GetAccountInfoResult, err error) bool {
 		return err != nil || acc == nil || acc.Value == nil || acc.Value.Data == nil
 	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		acc, err := c.GetAccountInfo(ctx, mint)
+		acc, err := c.GetAccountInfoWithOpts(ctx, mint, mintInfoOpts)
 		if !mintAccountMissing(acc, err) {
 			data := acc.Value.Data.GetBinary()
 			if len(data) < 82 {
@@ -1284,13 +1375,13 @@ func passesMintSecurity(ctx context.Context, c *rpc.Client, mint solana.PublicKe
 		if attempt+1 == maxAttempts {
 			break
 		}
-		fmt.Printf("Account not found, retrying... (%d/5)\n", attempt+1)
+		fmt.Printf("Account not found, retrying... (%d/%d)\n", attempt+1, maxAttempts)
 		select {
 		case <-ctx.Done():
 			return false, ctx.Err().Error()
 		default:
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(retryDelay)
 	}
 	return false, "mint account not found"
 }

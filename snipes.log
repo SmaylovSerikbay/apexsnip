@@ -1,0 +1,8 @@
+2026-03-21T12:15:40.6551983Z | PORTFOLIO | cash_usd=10.0000 | open_mtm_usd=0.0000 | total_usd=10.0000 | open_n=0
+2026-03-21T12:20:40.655588Z | PORTFOLIO | cash_usd=10.0000 | open_mtm_usd=0.0000 | total_usd=10.0000 | open_n=0
+2026-03-21T12:25:40.6551509Z | PORTFOLIO | cash_usd=10.0000 | open_mtm_usd=0.0000 | total_usd=10.0000 | open_n=0
+2026-03-21T12:30:40.655306Z | PORTFOLIO | cash_usd=10.0000 | open_mtm_usd=0.0000 | total_usd=10.0000 | open_n=0
+2026-03-21T12:35:40.655351Z | PORTFOLIO | cash_usd=10.0000 | open_mtm_usd=0.0000 | total_usd=10.0000 | open_n=0
+2026-03-21T12:38:47.9993923Z | BUY | mint=7t8f87vs8FFteE5kxcRH4XfBSLPu3mdnLKafErcKpump | bet_usd=1.0000 | buy_fee_usd=0.0150 | cash_after_usd=8.9850 | entry_usd=0.0000025204 | amount_sol=0.0500 | pnl_pct=n/a
+2026-03-21T12:42:50.7840981Z | PORTFOLIO | cash_usd=8.9850 | open_mtm_usd=1.0050 | total_usd=9.9900 | open_n=1
+2026-03-21T12:47:50.7700159Z | PORTFOLIO | cash_usd=8.9850 | open_mtm_usd=1.0004 | total_usd=9.9854 | open_n=1
