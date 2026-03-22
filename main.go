@@ -3,6 +3,9 @@
 // Raydium AMM V4: Initialize2 → rug-check → симуляция / swap_base_in + Jupiter TP/SL.
 // Pump.fun: Anchor create → mint из инструкции → симуляция BUY (без Raydium V4 пула).
 // Raydium CPMM (CP-Swap): Anchor initialize → выбор mint → симуляция BUY.
+//
+// Запуск: go run -mod=vendor .   или   go build -mod=vendor -o sniper.exe .
+// Не используйте «go run main.go» — тогда не подключаются другие файлы пакета (например pump_live.go).
 package main
 
 import (
@@ -47,22 +50,38 @@ import (
 
 // IS_SIMULATION: true — не подписывать и не слать транзакции в сеть (только логи).
 // false — реальный swap (нужны SOL/WSOL, ATA, рабочий RPC и приватный ключ).
-const IS_SIMULATION = true
+const IS_SIMULATION = false
 
-// Одночасовой эксперимент: виртуальный бюджет USD (только при IS_SIMULATION).
+// Стресс-тест (SIM): виртуальный бюджет USD, короткое окно для проверки TP/SL.
 const (
-	simStartingBalanceUSD = 10.0
-	simBetUSD             = 1.0  // каждая симуляция BUY списывает ровно $1 + комиссия
-	simTradeFeeBuyUSD     = 0.015 // ~priority fee, диапазон $0.01–0.02
-	simTradeFeeSellUSD    = 0.015
-	simExperimentDuration   = 60 * time.Minute
-	simPortfolioLogEvery  = 30 * time.Second
+	simStartingBalanceUSD  = 10.0
+	simBetPctOfBalance     = 0.20  // 20% от текущего total (cash + MTM открытых позиций)
+	simBetCapUSD           = 50.0  // верхний лимит ставки (анти-слиппедж)
+	simTradeFeeBuyUSD      = 0.015 // ~priority fee, диапазон $0.01–0.02
+	simTradeFeeSellUSD     = 0.015
+	simExperimentDuration  = 40 * time.Minute // дольше — больше данных в SIM
+	simPortfolioLogEvery   = 30 * time.Second
+	simMaxConcurrentTrades = 10
+	// CPMM в SIM: не-pump.fun допускается, если на Dexscreener есть минимальная ликвидность (после чистого mint).
+	cpmmSimMinLiquidityUSD = 50.0
+	// isSocialSafe: при 0 ссылок — для Pump достаточно любого баланса создателя >0; константа — справочный «жёсткий» порог в логах.
+	socialMinCreatorNoLinksSOL   = 0.1  // SOL (номинально; фактически links=0 → pass при creatorSOL > 0)
+	socialMinCreatorWithLinksSOL = 0.05 // SOL если links>=1 и известен creator (pump)
+	// Выход по времени: позиция «застыла» в коридоре PnL.
+	simTimeExitHoldDuration = 12 * time.Minute
+	simTimeExitFlatMinPct   = -3.0
+	simTimeExitFlatMaxPct   = 3.0
+	// Нет свежей котировки (Dex+Jupiter) дольше этого — выход как неликвид.
+	simStalePriceExitDuration = 5 * time.Minute
 )
 
-// Pump create (IDL): аккаунт «user» (плательщик/создатель сделки) и минимум SOL на кошельке для anti-rug.
+// Pump create (IDL): минимум SOL у создателя — зависит от соцссылок (Dexscreener).
 const (
 	pumpCreateUserAccountIndex = 7 // accounts[7] = user (signer)
-	pumpMinCreatorLamports     = uint64(100_000_000) // 0.1 SOL
+	// Без соцссылок (links=0): минимум SOL у создателя.
+	pumpMinCreatorLamports = uint64(10_000_000) // 0.01 SOL
+	// При ≥1 соцссылке (twitter/telegram в Dexscreener).
+	pumpMinCreatorLamportsWithSocial = uint64(10_000_000) // 0.01 SOL
 )
 
 // ANSI для зелёного баннера [TRADING] в терминале.
@@ -75,11 +94,11 @@ const (
 // BUY_LAMPORTS — размер «покупки» в лампортах (0.05 SOL по умолчанию).
 const BUY_LAMPORTS uint64 = 50_000_000
 
-// SlippageBps — 15% = 1500 bps (используется при расчёте minimum_amount_out).
-const SlippageBps uint64 = 1500
-
-// PriorityFeeLamports — целевой приоритетный «чай» ~0.001 SOL (lamports), в комбинации с MinMicroLamportsPerCU ниже.
-const PriorityFeeLamports uint64 = 1_000_000
+// slippageBps / priorityFeeLamports — для live: дефолт 40% (лимит min_out) и ~0.003 SOL; переопределяются SLIPPAGE_BPS и PRIORITY_FEE_LAMPORTS в .env.
+var (
+	slippageBps         uint64 = 4000 // 40% = 4000 bps (допустимое проскальзывание min_out, не гарантированная потеря)
+	priorityFeeLamports uint64 = 3_000_000 // 0.003 SOL
+)
 
 // MinMicroLamportsPerCU — нижняя граница цены за CU (рекомендация валидаторов / конкуренция в мемпуле).
 const MinMicroLamportsPerCU uint64 = 100_000
@@ -92,8 +111,15 @@ const (
 	jupiterPricePrimary  = "https://lite-api.jup.ag/price/v3?ids="
 	jupiterPriceFallback = "https://api.jup.ag/price/v2?ids="
 	pricePollInterval    = 2 * time.Second
-	takeProfitMultiplier = 1.50
-	stopLossMultiplier   = 0.80
+	// targetSL для новых позиций: −35% от цены входа.
+	targetStopLossMultiplier = 0.65
+	// Moonshot: при PnL ≥ +100% (цена ≥ 2x entry) — продать 50% (swapOut в симуляции).
+	moonshotPnL100Multiplier = 2.0 // +100% PnL = 2x
+	// После moonshot: targetTP не задаём (рост «бесконечный»); только targetSL по HWM.
+	trailingBreakevenPlusMultiplier = 1.10 // при HWM с PnL≥+100%: targetSL на +10% (безубыток)
+	trailingLock100PctMultiplier    = 2.00 // при PnL ≥ +200% по пику: SL на +100% от входа (цена 2x)
+	trailingProfitTier100Multiplier = 2.00 // HWM даёт PnL ≥ +100%
+	trailingProfitTier200Multiplier = 3.00 // HWM даёт PnL ≥ +200% (цена 3x)
 )
 
 // snipesLogFile — журнал сделок (BUY/SELL), без шума в консоли.
@@ -174,20 +200,36 @@ var (
 	// Диагностика WebSocket (logsSubscribeMentions): видно, приходят ли вообще уведомления.
 	wsNotifOK    atomic.Uint64 // сообщения с успешной транзакцией (Value.Err == nil)
 	wsRayLogLine atomic.Uint64 // найден непустой фрагмент после «ray_log»
-	wsSwapLike     atomic.Uint64 // в логах есть swap_base_in/out (типичная активность, не новый пул)
-	wsHybridPass   atomic.Uint64 // V4: Init-ray_log или initialize2 в логах
-	wsPassedPump   atomic.Uint64 // Pump: лог «Instruction: create» + дальше разбор tx
-	wsPassedCPMM   atomic.Uint64 // CPMM: лог «Instruction: initialize» + разбор tx
+	wsSwapLike   atomic.Uint64 // в логах есть swap_base_in/out (типичная активность, не новый пул)
+	wsHybridPass atomic.Uint64 // V4: Init-ray_log или initialize2 в логах
+	wsPassedPump atomic.Uint64 // Pump: лог «Instruction: create» + дальше разбор tx
+	wsPassedCPMM atomic.Uint64 // CPMM: лог «Instruction: initialize» + разбор tx
 
-	// Виртуальный портфель (IS_SIMULATION): старт $10, ставка $1 + комиссии на сделку.
-	simMu              sync.Mutex
-	simCashUSD         = simStartingBalanceUSD
-	simOpenEntryUSD    = make(map[string]float64) // mint -> цена входа Jupiter (USD)
-	simClosedTrades    atomic.Uint64               // завершённые сделки (SELL)
-	simTakeProfitHits  atomic.Uint64
-	simStopLossHits    atomic.Uint64
-	simFinalReportOnce sync.Once
+	// Виртуальный портфель (IS_SIMULATION): старт $10, dynamic stake + комиссии.
+	simMu                  sync.Mutex
+	simCashUSD             = simStartingBalanceUSD
+	simOpenPositions       = make(map[string]*simPosition) // mint -> открытая позиция
+	simClosedTrades        atomic.Uint64                   // завершённые сделки (SELL)
+	simTakeProfitHits      atomic.Uint64
+	simStopLossHits        atomic.Uint64
+	simMoonshotPartialHits atomic.Uint64 // 50% продано на 2x
+	simFinalReportOnce     sync.Once
+	// simLastQuotedPriceUSD — последняя удачная USD-цена с API (mint string -> float64), подстраховка для MTM.
+	simLastQuotedPriceUSD sync.Map
+	// wsHintedMintUSD — опционально: последняя цена из разбора логов WS (mint -> float64); иначе пусто.
+	wsHintedMintUSD sync.Map
 )
+
+type simPosition struct {
+	EntryUSD          float64
+	OpenedAt          time.Time // для удержания / time-exit
+	LastAPIPriceOKAt  time.Time // последний успешный ответ Dex или Jupiter (не кеш)
+	LastKnownPriceUSD float64   // последняя цена с API (для MTM / stale exit)
+	NotionalUSD       float64
+	RemainingFraction float64
+	DidMoonshotHalf   bool    // после продажи 50% на 2x
+	HighWaterMark     float64 // пиковая цена (USD) для trailing
+}
 
 const (
 	whatsappSessionDB  = "file:session.db?_pragma=foreign_keys(1)"
@@ -214,10 +256,63 @@ type RaydiumPoolKeys struct {
 	MarketAuthority  solana.PublicKey
 }
 
+// loadDotEnv — .env из каталога запуска; при необходимости дополнительный файл через ENV_FILE.
+func loadDotEnv() {
+	_ = godotenv.Load(".env")
+	_ = godotenv.Load()
+	if p := strings.TrimSpace(os.Getenv("ENV_FILE")); p != "" {
+		_ = godotenv.Load(p)
+	}
+}
+
+// applyTradingEnvFromEnv — SLIPPAGE_BPS (50–5000, 4000=40%), PRIORITY_FEE_LAMPORTS (мин. 5000 lamports).
+func applyTradingEnvFromEnv() {
+	if s := strings.TrimSpace(os.Getenv("SLIPPAGE_BPS")); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v >= 50 && v <= 5000 {
+			slippageBps = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PRIORITY_FEE_LAMPORTS")); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v >= 5_000 {
+			priorityFeeLamports = v
+		}
+	}
+}
+
+// logWalletStartup — адрес и баланс SOL при live-старте.
+func logWalletStartup(ctx context.Context, c *rpc.Client, owner solana.PublicKey) {
+	bal, err := c.GetBalance(ctx, owner, rpc.CommitmentProcessed)
+	sol := 0.0
+	if err == nil && bal != nil {
+		sol = float64(bal.Value) / 1e9
+	}
+	fmt.Println(bannerSep)
+	fmt.Printf("[LIVE] Wallet address: %s\n", owner.String())
+	fmt.Printf("[LIVE] SOL balance:    %.6f SOL\n", sol)
+	if err != nil {
+		log.Printf("[LIVE] warning: could not read balance: %v", err)
+	}
+	fmt.Printf("[LIVE] Slippage:       %.2f%% (min out)\n", float64(slippageBps)/100.0)
+	fmt.Printf("[LIVE] Priority fee:   %.6f SOL (%d lamports)\n", float64(priorityFeeLamports)/1e9, priorityFeeLamports)
+	fmt.Println(bannerSep)
+}
+
+// goHandlerRecover — обработчики WebSocket не должны ронять процесс при панике.
+func goHandlerRecover(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[%s] handler panic recovered: %v", name, r)
+			}
+		}()
+		fn()
+	}()
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	_ = godotenv.Load()
+	loadDotEnv()
 
 	if err := InitWhatsApp(context.Background()); err != nil {
 		fmt.Fprintf(os.Stderr, "WhatsApp: init failed, notifications disabled: %v\n", err)
@@ -233,6 +328,7 @@ func main() {
 	}
 
 	rpcClient := rpc.New(rpcURL)
+	applyTradingEnvFromEnv()
 
 	// Официальные mainnet ID: pump-public-docs и Raydium (CP-Swap). В промпте часто встречаются опечатки — правьте .env.
 	pumpFunProgram = publicKeyFromEnvOrDefault("PUMP_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
@@ -249,7 +345,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("PRIVATE_KEY base58 decode: %v", err)
 		}
-		log.Printf("live mode: wallet %s", wallet.PublicKey().String())
+		logWalletStartup(context.Background(), rpcClient, wallet.PublicKey())
 	}
 	// В SIMULATION режиме консоль без лишнего шума: только heartbeat и баннеры BUY/SELL.
 
@@ -258,10 +354,11 @@ func main() {
 	go heartbeatLoop(ctx)
 	go runRaydiumListenerForever(ctx, wssURL, rpcClient, wallet)
 	if IS_SIMULATION {
-		fmt.Printf("[SIM Experiment] длительность %v | старт $%.2f | ставка $%.2f + комиссия покупки $%.2f | комиссия продажи $%.2f | лог портфеля каждые %v\n",
-			simExperimentDuration, simStartingBalanceUSD, simBetUSD, simTradeFeeBuyUSD, simTradeFeeSellUSD, simPortfolioLogEvery)
+		fmt.Printf("[SIM Experiment] длительность %v | старт $%.2f | stake=20%% total (cap $%.2f) | max concurrent=%d | buy fee $%.2f | sell fee $%.2f | лог портфеля каждые %v\n",
+			simExperimentDuration, simStartingBalanceUSD, simBetCapUSD, simMaxConcurrentTrades, simTradeFeeBuyUSD, simTradeFeeSellUSD, simPortfolioLogEvery)
 		go simulationPortfolioLogLoop(ctx)
 		go simulationExperimentTimer(ctx)
+		go simPeriodicPositionLogs(ctx)
 	}
 
 	select {}
@@ -271,9 +368,9 @@ func main() {
 
 // runRaydiumListenerForever переподключается к WSS и заново подписывается на logsSubscribe при обрыве.
 func runRaydiumListenerForever(ctx context.Context, wssURL string, rpcClient *rpc.Client, wallet solana.PrivateKey) {
-	backoff := 2 * time.Second
-	const maxBackoff = 60 * time.Second
-	resetBackoff := func() { backoff = 2 * time.Second }
+	backoff := time.Duration(0)
+	const maxBackoff = 30 * time.Second
+	resetBackoff := func() { backoff = 0 }
 	for {
 		if ctx.Err() != nil {
 			return
@@ -282,7 +379,11 @@ func runRaydiumListenerForever(ctx context.Context, wssURL string, rpcClient *rp
 		if ctx.Err() != nil {
 			return
 		}
-		log.Printf("[ws] session ended: %v — reconnect in %s", err, backoff)
+		if backoff == 0 {
+			log.Printf("[ws] session ended: %v — reconnect immediately", err)
+		} else {
+			log.Printf("[ws] session ended: %v — reconnect in %s", err, backoff)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -290,6 +391,9 @@ func runRaydiumListenerForever(ctx context.Context, wssURL string, rpcClient *rp
 		}
 		if backoff < maxBackoff {
 			next := backoff * 2
+			if next == 0 {
+				next = 50 * time.Millisecond
+			}
 			if next > maxBackoff {
 				next = maxBackoff
 			}
@@ -300,7 +404,10 @@ func runRaydiumListenerForever(ctx context.Context, wssURL string, rpcClient *rp
 
 // runMultiProgramListenerSession — одно WSS-подключение, три подписки (V4 + Pump + CPMM) до ошибки Recv.
 func runMultiProgramListenerSession(ctx context.Context, wssURL string, rpcClient *rpc.Client, wallet solana.PrivateKey, onSubscribed func()) error {
-	client, err := ws.Connect(ctx, wssURL)
+	wsOpts := &ws.Options{
+		HandshakeTimeout: 25 * time.Second,
+	}
+	client, err := ws.ConnectWithOptions(ctx, wssURL, wsOpts)
 	if err != nil {
 		return fmt.Errorf("ws connect: %w", err)
 	}
@@ -425,7 +532,7 @@ func onV4LogMessage(ctx context.Context, rpcClient *rpc.Client, wallet solana.Pr
 	if _, loaded := seenSignatures.LoadOrStore(sig.String(), true); loaded {
 		return
 	}
-	go handleRaydiumLogNotification(ctx, rpcClient, wallet, sig)
+	goHandlerRecover("raydium_initialize2", func() { handleRaydiumLogNotification(ctx, rpcClient, wallet, sig) })
 }
 
 func onPumpLogMessage(ctx context.Context, rpcClient *rpc.Client, wallet solana.PrivateKey, msg *ws.LogResult) {
@@ -442,7 +549,7 @@ func onPumpLogMessage(ctx context.Context, rpcClient *rpc.Client, wallet solana.
 	if _, loaded := seenSignatures.LoadOrStore(sig.String(), true); loaded {
 		return
 	}
-	go handlePumpCreateNotification(ctx, rpcClient, wallet, sig)
+	goHandlerRecover("pump_create", func() { handlePumpCreateNotification(ctx, rpcClient, wallet, sig) })
 }
 
 func onCPMMLogMessage(ctx context.Context, rpcClient *rpc.Client, wallet solana.PrivateKey, msg *ws.LogResult) {
@@ -459,7 +566,7 @@ func onCPMMLogMessage(ctx context.Context, rpcClient *rpc.Client, wallet solana.
 	if _, loaded := seenSignatures.LoadOrStore(sig.String(), true); loaded {
 		return
 	}
-	go handleCPMMInitializeNotification(ctx, rpcClient, wallet, sig)
+	goHandlerRecover("cpmm_initialize", func() { handleCPMMInitializeNotification(ctx, rpcClient, wallet, sig) })
 }
 
 // logsAnchorInstructionForProgram — «Instruction: <name>» только для логов текущего CPI-фрейма target program,
@@ -659,22 +766,46 @@ func appendSnipeLog(line string) {
 	_ = f.Close()
 }
 
-// reportSimulationBuy списывает simBetUSD + комиссию покупки, фиксирует цену входа. false — недостаточно кэша или дубликат mint.
+// reportSimulationBuy открывает позицию с dynamic stake и списывает buy fee.
+// Начальный targetSL для выхода: −35% от entry (targetStopLossMultiplier).
+// false — недостаточно кэша, дубликат mint или превышен лимит параллельных позиций.
 func reportSimulationBuy(mint string, entryUSD float64) bool {
 	if !IS_SIMULATION {
 		return true
 	}
 	if entryUSD <= 0 {
-		log.Printf("[SIM] skip BUY: нет цены входа (Jupiter) для %s", mint)
+		log.Printf("[SIM] skip BUY: нет цены входа (Dex/Jupiter) для %s", mint)
 		return false
 	}
-	cost := simBetUSD + simTradeFeeBuyUSD
+
 	simMu.Lock()
-	if _, dup := simOpenEntryUSD[mint]; dup {
+	if _, dup := simOpenPositions[mint]; dup {
 		simMu.Unlock()
 		log.Printf("[SIM] skip BUY: позиция по %s уже открыта", mint)
 		return false
 	}
+	if len(simOpenPositions) >= simMaxConcurrentTrades {
+		simMu.Unlock()
+		log.Printf("[SIM] skip BUY: достигнут лимит параллельных позиций (%d)", simMaxConcurrentTrades)
+		return false
+	}
+	totalBalance := simCashUSD
+	for _, p := range simOpenPositions {
+		if p == nil || p.RemainingFraction <= 0 {
+			continue
+		}
+		totalBalance += p.NotionalUSD * p.RemainingFraction
+	}
+	notional := totalBalance * simBetPctOfBalance
+	if notional > simBetCapUSD {
+		notional = simBetCapUSD
+	}
+	if notional <= 0 {
+		simMu.Unlock()
+		log.Printf("[SIM] skip BUY: расчётный размер позиции <= 0 для %s", mint)
+		return false
+	}
+	cost := notional + simTradeFeeBuyUSD
 	if simCashUSD < cost {
 		have := simCashUSD
 		simMu.Unlock()
@@ -682,7 +813,18 @@ func reportSimulationBuy(mint string, entryUSD float64) bool {
 		return false
 	}
 	simCashUSD -= cost
-	simOpenEntryUSD[mint] = entryUSD
+	now := time.Now()
+	simOpenPositions[mint] = &simPosition{
+		EntryUSD:          entryUSD,
+		OpenedAt:          now,
+		LastAPIPriceOKAt:  now,
+		LastKnownPriceUSD: entryUSD,
+		NotionalUSD:       notional,
+		RemainingFraction: 1.0,
+		DidMoonshotHalf:   false,
+		HighWaterMark:     0,
+	}
+	simLastQuotedPriceUSD.Store(mint, entryUSD)
 	cashAfter := simCashUSD
 	simMu.Unlock()
 
@@ -691,29 +833,50 @@ func reportSimulationBuy(mint string, entryUSD float64) bool {
 	wide := strings.Repeat("═", 58)
 	gb := ansiGreen + ansiBold
 	fmt.Printf("\n%s%s%s\n", gb, wide, ansiReset)
-	fmt.Printf("%s🟢 [TRADING] Bought %s for $1.00.%s\n", gb, mint, ansiReset)
+	fmt.Printf("%s🟢 [TRADING] Bought %s.%s\n", gb, mint, ansiReset)
 	fmt.Printf("%s%s%s\n\n", gb, wide, ansiReset)
 	fmt.Println(bannerSep)
-	fmt.Printf("🟢 SIMULATION BUY: %s at %s | ставка $%.2f + fee $%.2f | cash после $%.2f | entry_usd=%.10f\n",
-		mint, ts, simBetUSD, simTradeFeeBuyUSD, cashAfter, entryUSD)
+	fmt.Printf("🟢 SIMULATION BUY: %s at %s | stake=$%.2f (20%% dynamic, cap $%.2f) + fee $%.2f | cash после $%.2f | entry_usd=%.10f\n",
+		mint, ts, notional, simBetCapUSD, simTradeFeeBuyUSD, cashAfter, entryUSD)
 	fmt.Println(bannerSep)
 	appendSnipeLog(fmt.Sprintf("%s | BUY | mint=%s | bet_usd=%.4f | buy_fee_usd=%.4f | cash_after_usd=%.4f | entry_usd=%.10f | amount_sol=%.4f | pnl_pct=n/a",
-		ts, mint, simBetUSD, simTradeFeeBuyUSD, cashAfter, entryUSD, sol))
+		ts, mint, notional, simTradeFeeBuyUSD, cashAfter, entryUSD, sol))
 	notifyNewTokenFoundWhatsApp(mint)
 	return true
 }
 
-func reportSimulationSell(mint, reason string, entry, exit float64) {
+func reportSimulationSell(mint, reason string, entry, exit, soldFraction float64) {
+	if soldFraction <= 0 {
+		return
+	}
+	if soldFraction > 1 {
+		soldFraction = 1
+	}
+	var (
+		proceeds      float64
+		pnlPct        float64
+		remainingFrac float64
+	)
 	if IS_SIMULATION {
-		var proceeds float64
 		simMu.Lock()
-		if _, had := simOpenEntryUSD[mint]; had {
-			delete(simOpenEntryUSD, mint)
+		if pos, had := simOpenPositions[mint]; had && pos != nil {
+			if soldFraction > pos.RemainingFraction {
+				soldFraction = pos.RemainingFraction
+			}
 			if entry > 0 {
-				proceeds = simBetUSD * (exit / entry)
+				proceeds = pos.NotionalUSD * soldFraction * (exit / entry)
+			}
+			pos.RemainingFraction -= soldFraction
+			if pos.RemainingFraction < 0 {
+				pos.RemainingFraction = 0
+			}
+			remainingFrac = pos.RemainingFraction
+			if remainingFrac == 0 {
+				delete(simOpenPositions, mint)
+				simClosedTrades.Add(1)
 			}
 		} else if entry > 0 {
-			proceeds = simBetUSD * (exit / entry)
+			proceeds = soldFraction * (exit / entry)
 		}
 		simCashUSD += proceeds - simTradeFeeSellUSD
 		if simCashUSD < 0 {
@@ -721,23 +884,28 @@ func reportSimulationSell(mint, reason string, entry, exit float64) {
 		}
 		simMu.Unlock()
 
-		simClosedTrades.Add(1)
 		switch reason {
-		case "TAKE_PROFIT":
+		case "TAKE_PROFIT", "TRAILING_STOP":
 			simTakeProfitHits.Add(1)
 		case "STOP_LOSS":
 			simStopLossHits.Add(1)
+		case "MOONSHOT_PARTIAL":
+			simMoonshotPartialHits.Add(1)
 		}
 	}
 
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
-	pnlPct := 0.0
+	pnlPct = 0.0
 	if entry > 0 {
 		pnlPct = (exit/entry - 1) * 100
 	}
 	fmt.Println(bannerSep)
 	fmt.Printf("🔴 SIMULATION SELL: %s at %s\n", mint, ts)
-	fmt.Printf("   %s  entry=%.8f exit=%.8f  pnl=%.2f%%\n", reason, entry, exit, pnlPct)
+	fmt.Printf("   %s  sold=%.2f%% entry=%.8f exit=%.8f pnl=%.2f%% remaining=%.2f%%\n",
+		reason, soldFraction*100, entry, exit, pnlPct, remainingFrac*100)
+	if reason == "MOONSHOT_PARTIAL" {
+		fmt.Println("[MOONSHOT] 2x reached! Sold 50%, remaining is risk-free")
+	}
 	fmt.Println(bannerSep)
 	var cashLine string
 	if IS_SIMULATION {
@@ -745,8 +913,8 @@ func reportSimulationSell(mint, reason string, entry, exit float64) {
 		cashLine = fmt.Sprintf(" | cash_after_usd=%.4f", simCashUSD)
 		simMu.Unlock()
 	}
-	appendSnipeLog(fmt.Sprintf("%s | SELL | mint=%s | reason=%s | entry=%.8f | exit=%.8f | pnl_pct=%.2f | sell_fee_usd=%.4f%s",
-		ts, mint, reason, entry, exit, pnlPct, simTradeFeeSellUSD, cashLine))
+	appendSnipeLog(fmt.Sprintf("%s | SELL | mint=%s | reason=%s | sold_fraction=%.4f | entry=%.8f | exit=%.8f | pnl_pct=%.2f | sell_fee_usd=%.4f%s",
+		ts, mint, reason, soldFraction, entry, exit, pnlPct, simTradeFeeSellUSD, cashLine))
 }
 
 func simulationMarkToMarketOpen(ctx context.Context) (cash float64, mtm float64, nOpen int, openPnl []string) {
@@ -754,11 +922,14 @@ func simulationMarkToMarketOpen(ctx context.Context) (cash float64, mtm float64,
 	cash = simCashUSD
 	type pair struct {
 		m   string
-		ent float64
+		pos simPosition
 	}
-	list := make([]pair, 0, len(simOpenEntryUSD))
-	for m, e := range simOpenEntryUSD {
-		list = append(list, pair{m, e})
+	list := make([]pair, 0, len(simOpenPositions))
+	for m, p := range simOpenPositions {
+		if p == nil || p.RemainingFraction <= 0 {
+			continue
+		}
+		list = append(list, pair{m: m, pos: *p})
 	}
 	nOpen = len(list)
 	simMu.Unlock()
@@ -769,17 +940,45 @@ func simulationMarkToMarketOpen(ctx context.Context) (cash float64, mtm float64,
 			return cash, mtm, nOpen, openPnl
 		default:
 		}
-		p, err := fetchJupiterPriceUSD(it.m)
-		if err != nil || it.ent <= 0 {
-			mtm += simBetUSD
-			openPnl = append(openPnl, fmt.Sprintf("[%s: n/a]", shortMint(it.m)))
+		if it.pos.EntryUSD <= 0 {
+			mtm += it.pos.NotionalUSD * it.pos.RemainingFraction
+			openPnl = append(openPnl, fmt.Sprintf("[%s: n/a (age: %s)]", shortMint(it.m), formatPositionAge(it.pos.OpenedAt)))
 			continue
 		}
-		mtm += simBetUSD * (p / it.ent)
-		pct := (p/it.ent - 1) * 100
+		p, err := fetchTokenPriceUSDFromAPIs(ctx, it.m)
+		if err != nil || p <= 0 {
+			simMu.Lock()
+			if live := simOpenPositions[it.m]; live != nil && live.LastKnownPriceUSD > 0 {
+				p = live.LastKnownPriceUSD
+			}
+			simMu.Unlock()
+		}
+		if p <= 0 {
+			mtm += it.pos.NotionalUSD * it.pos.RemainingFraction
+			openPnl = append(openPnl, fmt.Sprintf("[%s: n/a (age: %s)]", shortMint(it.m), formatPositionAge(it.pos.OpenedAt)))
+			continue
+		}
+		mtm += it.pos.NotionalUSD * it.pos.RemainingFraction * (p / it.pos.EntryUSD)
+		pct := (p/it.pos.EntryUSD - 1) * 100
 		openPnl = append(openPnl, fmt.Sprintf("[%s: %.2f%%]", shortMint(it.m), pct))
 	}
 	return cash, mtm, nOpen, openPnl
+}
+
+func formatPositionAge(openedAt time.Time) string {
+	if openedAt.IsZero() {
+		return "?"
+	}
+	d := time.Since(openedAt)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	return fmt.Sprintf("%dh%dm", h, m)
 }
 
 func shortMint(m string) string {
@@ -825,17 +1024,18 @@ func printFinalSimulationReport() {
 	cash, mtm, nOpen, _ := simulationMarkToMarketOpen(context.Background())
 	total := cash + mtm
 	fmt.Println(bannerSep)
-	fmt.Println("SIM EXPERIMENT — финальный отчёт (60 мин)")
+	fmt.Printf("SIM EXPERIMENT — финальный отчёт (%s)\n", simExperimentDuration.Round(time.Second))
 	fmt.Printf("Total Trades: %d\n", simClosedTrades.Load())
-	fmt.Printf("Successful (TP hit): %d\n", simTakeProfitHits.Load())
-	fmt.Printf("Failed (SL hit): %d\n", simStopLossHits.Load())
+	fmt.Printf("Successful (TP / trailing): %d\n", simTakeProfitHits.Load())
+	fmt.Printf("Moonshot 50%% at 2x: %d\n", simMoonshotPartialHits.Load())
+	fmt.Printf("Failed (SL): %d\n", simStopLossHits.Load())
 	fmt.Printf("Final Balance: $%.2f  (cash $%.2f + открытые MTM $%.2f)\n", total, cash, mtm)
 	if nOpen > 0 {
 		fmt.Printf("Открытых позиций на момент отчёта: %d (учтены в Final Balance)\n", nOpen)
 	}
 	fmt.Println(bannerSep)
-	appendSnipeLog(fmt.Sprintf("%s | SIM_FINAL | trades=%d tp=%d sl=%d total_usd=%.4f cash_usd=%.4f open_mtm_usd=%.4f open_n=%d",
-		time.Now().UTC().Format(time.RFC3339Nano), simClosedTrades.Load(), simTakeProfitHits.Load(), simStopLossHits.Load(),
+	appendSnipeLog(fmt.Sprintf("%s | SIM_FINAL | trades=%d tp_trail=%d moonshot50=%d sl=%d total_usd=%.4f cash_usd=%.4f open_mtm_usd=%.4f open_n=%d",
+		time.Now().UTC().Format(time.RFC3339Nano), simClosedTrades.Load(), simTakeProfitHits.Load(), simMoonshotPartialHits.Load(), simStopLossHits.Load(),
 		total, cash, mtm, nOpen))
 }
 
@@ -844,6 +1044,48 @@ func logRejected(mintAddr, reason string) {
 		mintAddr = "(unknown)"
 	}
 	log.Printf("[REJECTED] Mint: %s Reason: %s", mintAddr, reason)
+}
+
+// logRejectedSocial — отказ по social-links: строка [SKIP] с балансом создателя.
+func logRejectedSocial(mintAddr, reason string, linkCount int, creatorSOL float64, creatorKnown bool) {
+	logRejected(mintAddr, reason)
+	if !strings.Contains(reason, "social-links:") {
+		return
+	}
+	if creatorKnown {
+		fmt.Printf("[SKIP] No links, Creator SOL: %.2f\n", creatorSOL)
+	} else {
+		fmt.Printf("[SKIP] No links, Creator SOL: n/a\n")
+	}
+}
+
+// logPumpScanResult — одна короткая строка в консоль на каждый разобранный Pump.fun create (успех или отказ).
+// ok=false: reason — причина отказа; ok=true: reason — метка успеха (например "live buy", "simulation").
+func logPumpScanResult(mintAddr, sigStr string, ok bool, reason string) {
+	m := strings.TrimSpace(mintAddr)
+	if m == "" {
+		s := sigStr
+		if len(s) > 16 {
+			s = s[:8] + "…" + s[len(s)-4:]
+		}
+		m = "(mint unknown, sig " + s + ")"
+	} else if len(m) > 44 {
+		m = m[:18] + "…" + m[len(m)-10:]
+	}
+	if ok {
+		tag := strings.TrimSpace(reason)
+		if tag == "" {
+			tag = "passed checks"
+		}
+		fmt.Printf("[SCAN] Mint: %s | Result: OK (%s)\n", m, tag)
+		return
+	}
+	r := strings.TrimSpace(reason)
+	r = strings.ReplaceAll(r, "\n", " ")
+	if len(r) > 140 {
+		r = r[:137] + "..."
+	}
+	fmt.Printf("[SCAN] Mint: %s | Result: Failed (Reason: %s)\n", m, r)
 }
 
 func publicKeyFromEnvOrDefault(envKey, defaultBase58 string) solana.PublicKey {
@@ -978,8 +1220,29 @@ func handleRaydiumLogNotification(ctx context.Context, rpcClient *rpc.Client, wa
 
 	targetMint := pickNonBaseQuoteMint(init.CoinMint, init.PcMint)
 
-	if ok, why := passesMintSecurity(ctx, rpcClient, targetMint, solana.PublicKey{}); !ok {
+	if ok, why := passesMintSecurity(ctx, rpcClient, targetMint, solana.PublicKey{}, 0); !ok {
 		logRejected(targetMint.String(), fmt.Sprintf("risk-check: %s", why))
+		return
+	}
+	if ok, why, links, creSOL, creKnown, pot := isSocialSafe(ctx, rpcClient, targetMint.String(), solana.PublicKey{}); !ok {
+		if pot {
+			logRejectedSocial(targetMint.String(), why, links, creSOL, creKnown)
+		} else {
+			logRejected(targetMint.String(), why)
+		}
+		return
+	}
+
+	// SIM: сразу после risk+social — без ожидания ключей пула / ликвидности (оборачиваемость капитала).
+	if IS_SIMULATION {
+		entry, err := fetchTokenPriceUSDFromAPIs(ctx, targetMint.String())
+		if err != nil {
+			return
+		}
+		if !reportSimulationBuy(targetMint.String(), entry) {
+			return
+		}
+		startExitTracker(targetMint.String())
 		return
 	}
 
@@ -1005,27 +1268,12 @@ func handleRaydiumLogNotification(ctx context.Context, rpcClient *rpc.Client, wa
 
 	poolRegistry.Store(targetMint.String(), poolKeys)
 
-	if IS_SIMULATION {
-		entry, err := fetchJupiterPriceUSD(targetMint.String())
-		if err != nil {
-			return
-		}
-		if !reportSimulationBuy(targetMint.String(), entry) {
-			return
-		}
-		startExitTracker(targetMint.String(), entry)
-		return
-	}
 	if err := SwapToken(ctx, rpcClient, wallet, targetMint.String(), BUY_LAMPORTS); err != nil {
 		log.Printf("swap error: %v", err)
 		return
 	}
 	notifyNewTokenFoundWhatsApp(targetMint.String())
-	entry, err := fetchJupiterPriceUSD(targetMint.String())
-	if err != nil {
-		return
-	}
-	startExitTracker(targetMint.String(), entry)
+	startExitTracker(targetMint.String())
 }
 
 // handlePumpCreateNotification — mint из Anchor create (первый аккаунт); без Raydium V4 пула — только симуляция / Jupiter.
@@ -1033,46 +1281,94 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 	sigStr := sig.String()
 	out, err := getTransactionConfirmedRetry(ctx, rpcClient, sig)
 	if err != nil {
+		logPumpScanResult("", sigStr, false, fmt.Sprintf("getTransaction: %v", err))
 		logRejected("", fmt.Sprintf("[PUMP] getTransaction failed sig=%s: %v", sigStr, err))
 		return
 	}
 	if out.Meta == nil {
+		logPumpScanResult("", sigStr, false, "missing transaction meta")
 		logRejected("", fmt.Sprintf("[PUMP] missing meta sig=%s", sigStr))
 		return
 	}
 	if out.Meta.Err != nil {
+		logPumpScanResult("", sigStr, false, fmt.Sprintf("create tx failed on-chain: %v", out.Meta.Err))
 		logRejected("", fmt.Sprintf("[PUMP] tx failed sig=%s: %v", sigStr, out.Meta.Err))
 		return
 	}
 	tx, err := out.Transaction.GetTransaction()
 	if err != nil {
+		logPumpScanResult("", sigStr, false, fmt.Sprintf("decode transaction: %v", err))
 		logRejected("", fmt.Sprintf("[PUMP] decode tx sig=%s: %v", sigStr, err))
 		return
 	}
 	keys := fullAccountKeys(tx.Message.AccountKeys, out.Meta)
 	mint, pumpDev, ok := findPumpCreateMintAndUserInTransaction(tx, out.Meta, keys)
 	if !ok {
+		logPumpScanResult("", sigStr, false, "no pump create instruction in tx")
 		logRejected("", fmt.Sprintf("[PUMP] no create ix sig=%s", sigStr))
 		return
 	}
+	mintStr := mint.String()
+	if len(mintStr) > 48 {
+		mintStr = mintStr[:36] + "…"
+	}
+	fmt.Printf("[SCAN] Checking mint: %s…\n", mintStr)
 
-	if ok, why := passesMintSecurity(ctx, rpcClient, mint, pumpDev); !ok {
+	linkCountForRisk := 0
+	if body, err := fetchDexscreenerTokenPairs(ctx, mint.String()); err == nil {
+		linkCountForRisk = countTwitterTelegramLinks(&body, mint.String())
+	}
+	minCreatorLamports := pumpMinCreatorLamports
+	if linkCountForRisk >= 1 {
+		minCreatorLamports = pumpMinCreatorLamportsWithSocial
+	}
+	if ok, why := passesMintSecurity(ctx, rpcClient, mint, pumpDev, minCreatorLamports); !ok {
+		logPumpScanResult(mint.String(), sigStr, false, "risk-check: "+why)
 		logRejected(mint.String(), fmt.Sprintf("[PUMP] risk-check: %s", why))
+		return
+	}
+	if ok, why, links, creSOL, creKnown, pot := isSocialSafe(ctx, rpcClient, mint.String(), pumpDev); !ok {
+		logPumpScanResult(mint.String(), sigStr, false, "social filter: "+why)
+		if pot {
+			logRejectedSocial(mint.String(), "[PUMP] "+why, links, creSOL, creKnown)
+		} else {
+			logRejected(mint.String(), "[PUMP] "+why)
+		}
 		return
 	}
 
 	if IS_SIMULATION {
-		entry, err := fetchJupiterPriceUSD(mint.String())
+		entry, err := fetchTokenPriceUSDFromAPIs(ctx, mint.String())
 		if err != nil {
+			logPumpScanResult(mint.String(), sigStr, false, fmt.Sprintf("price API (sim): %v", err))
 			return
 		}
 		if !reportSimulationBuy(mint.String(), entry) {
+			logPumpScanResult(mint.String(), sigStr, false, "sim: position not opened (no price / duplicate / limit / cash)")
 			return
 		}
-		startExitTracker(mint.String(), entry)
+		logPumpScanResult(mint.String(), sigStr, true, "simulation position opened")
+		startExitTracker(mint.String())
 		return
 	}
-	log.Printf("[PUMP] live swap не реализован для bonding curve; mint=%s", mint)
+	fmt.Printf("[ATTEMPT] Buying %s with %.0f%% slippage...\n", mint.String(), float64(slippageBps)/100.0)
+	buySig, err := swapPumpFun(ctx, rpcClient, wallet, mint, BUY_LAMPORTS)
+	if err != nil {
+		logPumpScanResult(mint.String(), sigStr, false, fmt.Sprintf("live swapPumpFun: %v", err))
+		log.Printf("[PUMP] live buy failed mint=%s: %v", mint.String(), err)
+		return
+	}
+	logPumpScanResult(mint.String(), sigStr, true, "live buy submitted")
+	log.Printf("[PUMP] live BUY submitted | tx=%s | %s", buySig.String(), solscanTxURL(buySig.String()))
+	fmt.Printf("🟢 [PUMP] Live BUY | Solscan: %s\n", solscanTxURL(buySig.String()))
+	entry, err := fetchTokenPriceUSDFromAPIs(ctx, mint.String())
+	if err != nil {
+		log.Printf("[PUMP] entry price fetch after buy: %v", err)
+		entry = 0
+	}
+	registerLivePumpBuy(mint.String(), entry)
+	startLivePumpExitTracker(ctx, rpcClient, wallet, mint.String())
+	notifyNewTokenFoundWhatsApp(mint.String())
 }
 
 // handleCPMMInitializeNotification — новый CP-пул; «целевой» mint как у V4 (не WSOL/USDC/USDT).
@@ -1104,20 +1400,49 @@ func handleCPMMInitializeNotification(ctx context.Context, rpcClient *rpc.Client
 	}
 	targetMint := pickNonBaseQuoteMint(t0, t1)
 
-	if ok, why := passesMintSecurity(ctx, rpcClient, targetMint, solana.PublicKey{}); !ok {
+	if ok, why := passesMintSecurity(ctx, rpcClient, targetMint, solana.PublicKey{}, 0); !ok {
 		logRejected(targetMint.String(), fmt.Sprintf("[CPMM] risk-check: %s", why))
 		return
 	}
+	if ok, why, links, creSOL, creKnown, pot := isSocialSafe(ctx, rpcClient, targetMint.String(), solana.PublicKey{}); !ok {
+		if pot {
+			logRejectedSocial(targetMint.String(), "[CPMM] "+why, links, creSOL, creKnown)
+		} else {
+			logRejected(targetMint.String(), "[CPMM] "+why)
+		}
+		return
+	}
+	if IS_SIMULATION {
+		isPump, maxLiq, err := dexscreenerPumpFunAndMaxLiquidityUSD(ctx, targetMint.String())
+		if err != nil {
+			logRejected(targetMint.String(), fmt.Sprintf("[CPMM] dex probe failed: %v", err))
+			return
+		}
+		if !isPump && maxLiq < cpmmSimMinLiquidityUSD {
+			logRejected(targetMint.String(), fmt.Sprintf("[CPMM] stress sim: non-pumpfun needs dex liquidity >= $%.0f (got $%.2f)", cpmmSimMinLiquidityUSD, maxLiq))
+			return
+		}
+	} else {
+		isPump, _, err := dexscreenerPumpFunAndMaxLiquidityUSD(ctx, targetMint.String())
+		if err != nil {
+			logRejected(targetMint.String(), fmt.Sprintf("[CPMM] dex probe failed: %v", err))
+			return
+		}
+		if !isPump {
+			log.Printf("[CPMM] skip live (not pump.fun, sim-only path): mint=%s", targetMint.String())
+			return
+		}
+	}
 
 	if IS_SIMULATION {
-		entry, err := fetchJupiterPriceUSD(targetMint.String())
+		entry, err := fetchTokenPriceUSDFromAPIs(ctx, targetMint.String())
 		if err != nil {
 			return
 		}
 		if !reportSimulationBuy(targetMint.String(), entry) {
 			return
 		}
-		startExitTracker(targetMint.String(), entry)
+		startExitTracker(targetMint.String())
 		return
 	}
 	log.Printf("[CPMM] live swap не реализован для CP-Swap; mint=%s", targetMint)
@@ -1329,12 +1654,17 @@ func pickNonBaseQuoteMint(coin, pc solana.PublicKey) solana.PublicKey {
 
 // ---------- 3) Rug-check: Mint account (mint authority & freeze authority) ----------
 
-// passesMintSecurity — mint authority/freeze + опционально ≥0.1 SOL у pumpDev (создатель create).
+// passesMintSecurity — mint authority/freeze + опционально минимум SOL у pumpDev (создатель Pump create).
 // pumpDev = zero pubkey → проверка создателя не выполняется (Raydium / CPMM).
+// pumpCreatorMinLamports: для Pump; при 0 подставляется pumpMinCreatorLamports (0.02 SOL).
 // Новые mint: GetAccountInfo с commitment=processed, 10×500ms ≈ 5s ожидания индексации.
-func passesMintSecurity(ctx context.Context, c *rpc.Client, mint solana.PublicKey, pumpDev solana.PublicKey) (bool, string) {
+func passesMintSecurity(ctx context.Context, c *rpc.Client, mint solana.PublicKey, pumpDev solana.PublicKey, pumpCreatorMinLamports uint64) (bool, string) {
 	var zero solana.PublicKey
 	if !pumpDev.Equals(zero) {
+		minLam := pumpCreatorMinLamports
+		if minLam == 0 {
+			minLam = pumpMinCreatorLamports
+		}
 		bal, err := c.GetBalance(ctx, pumpDev, rpc.CommitmentProcessed)
 		if err != nil {
 			return false, fmt.Sprintf("creator getBalance failed: %v", err)
@@ -1342,8 +1672,8 @@ func passesMintSecurity(ctx context.Context, c *rpc.Client, mint solana.PublicKe
 		if bal == nil {
 			return false, "creator getBalance: empty response"
 		}
-		if bal.Value < pumpMinCreatorLamports {
-			return false, fmt.Sprintf("creator SOL < 0.1 (have %.4f SOL)", float64(bal.Value)/1e9)
+		if bal.Value < minLam {
+			return false, fmt.Sprintf("creator SOL < %.4f (have %.4f SOL)", float64(minLam)/1e9, float64(bal.Value)/1e9)
 		}
 	}
 
@@ -1491,17 +1821,20 @@ func SwapToken(ctx context.Context, rpcClient *rpc.Client, wallet solana.Private
 		return fmt.Errorf("no pool in registry for mint %s (wait for initialize2)", mintAddress)
 	}
 	keys := v.(*RaydiumPoolKeys)
-	mint := solana.MustPublicKeyFromBase58(mintAddress)
+	mint, err := solana.PublicKeyFromBase58(mintAddress)
+	if err != nil {
+		return fmt.Errorf("invalid mint address: %w", err)
+	}
 
 	if IS_SIMULATION {
-		entry, err := fetchJupiterPriceUSD(mintAddress)
+		entry, err := fetchTokenPriceUSDFromAPIs(context.Background(), mintAddress)
 		if err != nil {
 			return err
 		}
 		if !reportSimulationBuy(mintAddress, entry) {
 			return nil
 		}
-		startExitTracker(mintAddress, entry)
+		startExitTracker(mintAddress)
 		return nil
 	}
 
@@ -1525,7 +1858,7 @@ func SwapToken(ctx context.Context, rpcClient *rpc.Client, wallet solana.Private
 		return err
 	}
 	expectedBaseOut := quoteToBaseOut(amount, baseBal, quoteBal)
-	minOut := applySlippage(expectedBaseOut, SlippageBps)
+	minOut := applySlippage(expectedBaseOut, slippageBps)
 
 	swapIx, err := buildRaydiumSwapBaseIn(keys, userQuoteAta, userBaseAta, owner, amount, minOut)
 	if err != nil {
@@ -1588,15 +1921,15 @@ func SwapToken(ctx context.Context, rpcClient *rpc.Client, wallet solana.Private
 
 	sig, err := sendSwapTransaction(ctx, rpcClient, tx)
 	if err != nil {
-		return err
+		return fmt.Errorf("swap send failed mint=%s: %w", mintAddress, err)
 	}
-	log.Printf("submitted swap tx: %s", sig.String())
+	log.Printf("submitted swap tx: %s mint=%s", sig.String(), mintAddress)
 	return nil
 }
 
-// effectiveMicroLamportsPerCU — не ниже MinMicroLamportsPerCU и при желании выше из PriorityFeeLamports.
+// effectiveMicroLamportsPerCU — не ниже MinMicroLamportsPerCU и при желании выше из priorityFeeLamports (.env).
 func effectiveMicroLamportsPerCU() uint64 {
-	calc := PriorityFeeLamports * 1_000_000 / uint64(ComputeUnitLimit)
+	calc := priorityFeeLamports * 1_000_000 / uint64(ComputeUnitLimit)
 	if calc < MinMicroLamportsPerCU {
 		return MinMicroLamportsPerCU
 	}
@@ -1661,10 +1994,14 @@ func sendSwapTransaction(ctx context.Context, rpcClient *rpc.Client, tx *solana.
 		log.Printf("JITO_BLOCK_ENGINE_URL задан — транзакция всё равно уходит через RPC. " +
 			"Атомарный bundle (tip + порядок) против sandwich требует Jito Block Engine API: https://docs.jito.wtf/ — интеграцию добавь отдельно.")
 	}
-	return rpcClient.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+	sig, err := rpcClient.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
 		SkipPreflight:       false,
 		PreflightCommitment: rpc.CommitmentProcessed,
 	})
+	if err != nil {
+		return solana.Signature{}, fmt.Errorf("SendTransactionWithOpts: %w", err)
+	}
+	return sig, nil
 }
 
 func ensureATAInstruction(ctx context.Context, c *rpc.Client, out *[]solana.Instruction, owner, mint solana.PublicKey) (solana.PublicKey, error) {
@@ -1726,10 +2063,17 @@ func quoteToBaseOut(quoteIn, baseReserve, quoteReserve uint64) uint64 {
 }
 
 func applySlippage(amount uint64, slippageBps uint64) uint64 {
-	if amount == 0 {
+	if amount == 0 || slippageBps >= 10_000 {
 		return 0
 	}
-	return amount * (10_000 - slippageBps) / 10_000
+	// big.Int: избегаем переполнения u64 при amount * (10000 - slip)
+	a := new(big.Int).SetUint64(amount)
+	mul := new(big.Int).Mul(a, big.NewInt(int64(10_000-slippageBps)))
+	mul.Div(mul, big.NewInt(10_000))
+	if !mul.IsUint64() {
+		return 0
+	}
+	return mul.Uint64()
 }
 
 func buildRaydiumSwapBaseIn(
@@ -1765,12 +2109,100 @@ func buildRaydiumSwapBaseIn(
 	return solana.NewInstruction(raydiumAMMProgram, metas, data), nil
 }
 
-// ---------- 6) Выход по цене (Jupiter) ----------
+// ---------- 6) Выход по цене (Dexscreener → Jupiter → подсказка из WS, если есть) ----------
 
-func fetchJupiterPriceUSD(mint string) (float64, error) {
+func parseDexscreenerPriceUsd(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f <= 0 {
+		return 0
+	}
+	return f
+}
+
+func coalesceDexPriceUsd(v interface{}) float64 {
+	if v == nil {
+		return 0
+	}
+	switch t := v.(type) {
+	case string:
+		return parseDexscreenerPriceUsd(t)
+	case float64:
+		if t > 0 {
+			return t
+		}
+	case json.Number:
+		f, err := t.Float64()
+		if err == nil && f > 0 {
+			return f
+		}
+	}
+	return 0
+}
+
+// fetchDexscreenerBestPriceUSD — priceUsd пары с максимальной ликвидностью по mint.
+func fetchDexscreenerBestPriceUSD(ctx context.Context, mint string) (float64, error) {
+	body, err := fetchDexscreenerTokenPairs(ctx, mint)
+	if err != nil {
+		return 0, err
+	}
+	want := strings.ToLower(strings.TrimSpace(mint))
+	var bestLiq float64
+	var bestPrice float64
+	for _, p := range body.Pairs {
+		base := strings.ToLower(strings.TrimSpace(p.BaseToken.Address))
+		quote := strings.ToLower(strings.TrimSpace(p.QuoteToken.Address))
+		if base != want && quote != want {
+			continue
+		}
+		pr := coalesceDexPriceUsd(p.PriceUsd)
+		if pr <= 0 {
+			continue
+		}
+		if p.Liquidity.Usd >= bestLiq {
+			bestLiq = p.Liquidity.Usd
+			bestPrice = pr
+		}
+	}
+	if bestPrice <= 0 {
+		return 0, fmt.Errorf("dexscreener: no priceUsd for mint")
+	}
+	return bestPrice, nil
+}
+
+// fetchTokenPriceUSDFromAPIs — сначала Dexscreener, затем Jupiter (lite + fallback), затем опциональная подсказка из WS.
+func fetchTokenPriceUSDFromAPIs(ctx context.Context, mint string) (float64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if p, err := fetchDexscreenerBestPriceUSD(ctx, mint); err == nil && p > 0 {
+		simLastQuotedPriceUSD.Store(mint, p)
+		return p, nil
+	}
+	if p, err := fetchJupiterPriceUSD(ctx, mint); err == nil && p > 0 {
+		simLastQuotedPriceUSD.Store(mint, p)
+		return p, nil
+	}
+	if v, ok := wsHintedMintUSD.Load(mint); ok {
+		if p, ok := v.(float64); ok && p > 0 {
+			simLastQuotedPriceUSD.Store(mint, p)
+			return p, nil
+		}
+	}
+	return 0, fmt.Errorf("no price from dexscreener, jupiter or ws hint")
+}
+
+func fetchJupiterPriceUSD(ctx context.Context, mint string) (float64, error) {
 	client := &http.Client{Timeout: 8 * time.Second}
 	try := func(base string) (float64, error) {
-		resp, err := client.Get(base + mint)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+mint, nil)
+		if err != nil {
+			return 0, err
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			return 0, err
 		}
@@ -1844,34 +2276,199 @@ func parseJSONFloat(raw json.RawMessage) (float64, bool) {
 	return 0, false
 }
 
-func startExitTracker(mint string, entry float64) {
-	go func() {
-		tick := func() bool {
-			p, err := fetchJupiterPriceUSD(mint)
-			if err != nil {
-				return false
+// positionPnLPercent — нереализованный PnL в % от цены входа.
+func positionPnLPercent(entry, price float64) float64 {
+	if entry <= 0 {
+		return 0
+	}
+	return (price/entry - 1) * 100
+}
+
+// trailingStopPriceUSD — после продажи 50% на +100% PnL: верх не ограничен (нет targetTP).
+// HWM с PnL≥+200% → targetSL на +100% к входу (цена 2× entry); HWM с PnL≥+100% → targetSL +10%; иначе начальный targetSL −35%.
+func trailingStopPriceUSD(entry, hwm float64, afterMoonshot bool) float64 {
+	if !afterMoonshot {
+		return entry * targetStopLossMultiplier
+	}
+	if hwm >= entry*trailingProfitTier200Multiplier {
+		return entry * trailingLock100PctMultiplier
+	}
+	if hwm >= entry*trailingProfitTier100Multiplier {
+		return entry * trailingBreakevenPlusMultiplier
+	}
+	return entry * targetStopLossMultiplier
+}
+
+// monitorPosition — стратегия «2x–3x Moonshot» (симуляция):
+// − Начальный targetSL: −35% от entry.
+// − При PnL +100% (2×): продать ровно 50% позиции; targetTP снимаем (рост без потолка); новый targetSL по HWM → +10% к входу после достижения 2× по пику.
+// − При PnL +200% по пику (HWM ≥ 3× entry): подтянуть targetSL на +100% к входу (цена выхода 2× entry).
+func monitorPosition(mint string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	price, err := fetchTokenPriceUSDFromAPIs(ctx, mint)
+
+	simMu.Lock()
+	pos, ok := simOpenPositions[mint]
+	if !ok || pos == nil || pos.RemainingFraction <= 0 {
+		simMu.Unlock()
+		return true
+	}
+	entryUSD := pos.EntryUSD
+	openedAt := pos.OpenedAt
+	didMoon := pos.DidMoonshotHalf
+	remaining := pos.RemainingFraction
+
+	if err == nil && price > 0 {
+		pos.LastAPIPriceOKAt = time.Now()
+		pos.LastKnownPriceUSD = price
+		if price > pos.HighWaterMark {
+			pos.HighWaterMark = price
+		}
+	}
+	hwm := pos.HighWaterMark
+	lastAPI := pos.LastAPIPriceOKAt
+	lastKnown := pos.LastKnownPriceUSD
+	simMu.Unlock()
+
+	if err != nil || price <= 0 {
+		ref := lastAPI
+		if ref.IsZero() && !openedAt.IsZero() {
+			ref = openedAt
+		}
+		if !ref.IsZero() && time.Since(ref) >= simStalePriceExitDuration && remaining > 0 {
+			exitPx := lastKnown
+			if exitPx <= 0 {
+				exitPx = entryUSD
 			}
-			if p >= entry*takeProfitMultiplier {
-				reportSimulationSell(mint, "TAKE_PROFIT", entry, p)
-				return true
+			fmt.Printf("[TIME EXIT] [STALE DATA] No fresh quote for %s (>= %v since last API) — closing as illiquid | exit_price=%.10f\n",
+				mint, simStalePriceExitDuration, exitPx)
+			reportSimulationSell(mint, "TIME_EXIT_STALE", entryUSD, exitPx, remaining)
+			return true
+		}
+		return false
+	}
+
+	p := price
+	// PnL в %: (текущая_цена/вход - 1) * 100 — корректно для long в USD/token.
+	pnl := positionPnLPercent(entryUSD, p)
+
+	// Time-based exit: >12 мин и «флэт» −3%…+3% — закрыть остаток по рынку (симуляция).
+	if !openedAt.IsZero() && time.Since(openedAt) >= simTimeExitHoldDuration {
+		if pnl >= simTimeExitFlatMinPct && pnl <= simTimeExitFlatMaxPct && remaining > 0 {
+			fmt.Printf("[TIME EXIT] Closing stagnant position %s | PnL: %.1f%%\n", mint, pnl)
+			reportSimulationSell(mint, "TIME_EXIT", entryUSD, p, remaining)
+			return true
+		}
+	}
+
+	if !didMoon {
+		// До первой фиксации: только начальный targetSL (−35%).
+		if p <= entryUSD*targetStopLossMultiplier {
+			reportSimulationSell(mint, "STOP_LOSS", entryUSD, p, remaining)
+			return true
+		}
+		// PnL ≥ +100% → 50% swapOut (в live здесь был бы реальный swap).
+		if positionPnLPercent(entryUSD, p) >= 100 && remaining >= 1.0 {
+			reportSimulationSell(mint, "MOONSHOT_PARTIAL", entryUSD, p, 0.5)
+			simMu.Lock()
+			if p2 := simOpenPositions[mint]; p2 != nil {
+				p2.DidMoonshotHalf = true
+				if p > p2.HighWaterMark {
+					p2.HighWaterMark = p
+				}
 			}
-			if p <= entry*stopLossMultiplier {
-				reportSimulationSell(mint, "STOP_LOSS", entry, p)
-				return true
-			}
+			simMu.Unlock()
 			return false
 		}
-		if tick() {
+		return false
+	}
+
+	// Остаток: без фиксированного TP; только динамический targetSL по HWM.
+	stopPx := trailingStopPriceUSD(entryUSD, hwm, true)
+	if p <= stopPx {
+		reason := "TRAILING_STOP"
+		if stopPx <= entryUSD*targetStopLossMultiplier+1e-15 {
+			reason = "STOP_LOSS"
+		}
+		reportSimulationSell(mint, reason, entryUSD, p, remaining)
+		return true
+	}
+	return false
+}
+
+func startExitTracker(mint string) {
+	go func() {
+		if monitorPosition(mint) {
 			return
 		}
 		t := time.NewTicker(pricePollInterval)
 		defer t.Stop()
 		for range t.C {
-			if tick() {
+			if monitorPosition(mint) {
 				return
 			}
 		}
 	}()
+}
+
+// simPeriodicPositionLogs — в SIM: каждые 10 с [DEBUG] PnL, каждые 15 с STATUS (цена / PnL / half-sold).
+func simPeriodicPositionLogs(ctx context.Context) {
+	t := time.NewTicker(1 * time.Second)
+	defer t.Stop()
+	n := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if !IS_SIMULATION {
+				return
+			}
+			n++
+			simMu.Lock()
+			mints := make([]string, 0, len(simOpenPositions))
+			for m := range simOpenPositions {
+				mints = append(mints, m)
+			}
+			simMu.Unlock()
+			for _, mint := range mints {
+				pctx, pcancel := context.WithTimeout(context.Background(), 10*time.Second)
+				price, err := fetchTokenPriceUSDFromAPIs(pctx, mint)
+				pcancel()
+				simMu.Lock()
+				pos := simOpenPositions[mint]
+				if pos == nil || pos.RemainingFraction <= 0 {
+					simMu.Unlock()
+					continue
+				}
+				entry := pos.EntryUSD
+				half := pos.DidMoonshotHalf
+				if err == nil && price > 0 {
+					pos.LastAPIPriceOKAt = time.Now()
+					pos.LastKnownPriceUSD = price
+				} else if pos.LastKnownPriceUSD > 0 {
+					price = pos.LastKnownPriceUSD
+					err = nil
+				}
+				simMu.Unlock()
+				if err != nil || entry <= 0 {
+					continue
+				}
+				pnl := positionPnLPercent(entry, price)
+				if n%10 == 0 {
+					fmt.Printf("[DEBUG] Mint: %s PnL: %.1f%%\n", mint, pnl)
+				}
+				if n%15 == 0 {
+					halfStr := "No"
+					if half {
+						halfStr = "Yes"
+					}
+					fmt.Printf("STATUS: %s | Price: %.10f | PnL: %.1f%% | HalfSold: %s\n", mint, price, pnl, halfStr)
+				}
+			}
+		}
+	}
 }
 
 // ---------- WhatsApp (whatsmeow) — в main.go, чтобы работал `go run main.go` ----------
@@ -1997,6 +2594,11 @@ func notifyNewTokenFoundWhatsApp(mint string) {
 
 type dexscreenerTokenPairs struct {
 	Pairs []struct {
+		DexID     string `json:"dexId"`
+		PriceUsd  interface{} `json:"priceUsd"` // string или number в ответе API
+		Liquidity struct {
+			Usd float64 `json:"usd"`
+		} `json:"liquidity"`
 		BaseToken struct {
 			Address string `json:"address"`
 			Name    string `json:"name"`
@@ -2007,7 +2609,149 @@ type dexscreenerTokenPairs struct {
 			Name    string `json:"name"`
 			Symbol  string `json:"symbol"`
 		} `json:"quoteToken"`
+		Info struct {
+			Socials []struct {
+				Type string `json:"type"`
+				URL  string `json:"url"`
+			} `json:"socials"`
+		} `json:"info"`
 	} `json:"pairs"`
+}
+
+// dexscreenerPumpFunAndMaxLiquidityUSD — один запрос: есть ли пара pump.fun и макс. liquidity.usd по mint.
+func dexscreenerPumpFunAndMaxLiquidityUSD(ctx context.Context, mint string) (isPumpFun bool, maxLiqUSD float64, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.dexscreener.com/latest/dex/tokens/"+mint, nil)
+	if err != nil {
+		return false, 0, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, 0, fmt.Errorf("dex status %d", resp.StatusCode)
+	}
+	var body dexscreenerTokenPairs
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return false, 0, err
+	}
+	want := strings.ToLower(strings.TrimSpace(mint))
+	for _, p := range body.Pairs {
+		matches := strings.ToLower(strings.TrimSpace(p.BaseToken.Address)) == want ||
+			strings.ToLower(strings.TrimSpace(p.QuoteToken.Address)) == want
+		if !matches {
+			continue
+		}
+		if p.Liquidity.Usd > maxLiqUSD {
+			maxLiqUSD = p.Liquidity.Usd
+		}
+		if strings.EqualFold(strings.TrimSpace(p.DexID), "pumpfun") {
+			isPumpFun = true
+		}
+	}
+	return isPumpFun, maxLiqUSD, nil
+}
+
+func fetchDexscreenerTokenPairs(ctx context.Context, mint string) (dexscreenerTokenPairs, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.dexscreener.com/latest/dex/tokens/"+mint, nil)
+	if err != nil {
+		return dexscreenerTokenPairs{}, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return dexscreenerTokenPairs{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return dexscreenerTokenPairs{}, fmt.Errorf("dex status %d", resp.StatusCode)
+	}
+	var body dexscreenerTokenPairs
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return dexscreenerTokenPairs{}, err
+	}
+	return body, nil
+}
+
+func countTwitterTelegramLinks(body *dexscreenerTokenPairs, mint string) int {
+	want := strings.ToLower(strings.TrimSpace(mint))
+	uniq := make(map[string]struct{})
+	for _, p := range body.Pairs {
+		matches := strings.ToLower(strings.TrimSpace(p.BaseToken.Address)) == want ||
+			strings.ToLower(strings.TrimSpace(p.QuoteToken.Address)) == want
+		if !matches {
+			continue
+		}
+		for _, s := range p.Info.Socials {
+			typ := strings.ToLower(strings.TrimSpace(s.Type))
+			if typ != "twitter" && typ != "telegram" {
+				continue
+			}
+			u := strings.TrimSpace(strings.ToLower(s.URL))
+			if u == "" {
+				continue
+			}
+			uniq[typ+"|"+u] = struct{}{}
+		}
+	}
+	return len(uniq)
+}
+
+// isSocialSafe — соцфильтр для «2x–3x Moonshot»:
+// - links >= 1 и creator известен (pump) → creatorSOL >= socialMinCreatorWithLinksSOL;
+// - links >= 1 и creator неизвестен (Raydium/CPMM) → разрешено по ссылкам;
+// - links == 0 и creator известен (Pump) → достаточно любого баланса > 0 SOL (порог socialMinCreatorNoLinksSOL только для сообщений);
+// - links == 0 и creator неизвестен → отказ (нужна ссылка или известный создатель).
+func isSocialSafe(ctx context.Context, rpcClient *rpc.Client, mint string, creator solana.PublicKey) (ok bool, reason string, linkCount int, creatorSOL float64, creatorKnown bool, printPotential bool) {
+	body, err := fetchDexscreenerTokenPairs(ctx, mint)
+	if err != nil {
+		return false, fmt.Sprintf("social-links: dex fetch failed: %v", err), 0, 0, false, false
+	}
+	linkCount = countTwitterTelegramLinks(&body, mint)
+	var zero solana.PublicKey
+
+	if linkCount >= 1 {
+		if creator.Equals(zero) {
+			return true, "", linkCount, 0, false, false
+		}
+		bal, err := rpcClient.GetBalance(ctx, creator, rpc.CommitmentProcessed)
+		if err != nil {
+			return false, fmt.Sprintf("social-links: creator getBalance: %v", err), linkCount, 0, true, false
+		}
+		if bal == nil {
+			return false, "social-links: creator getBalance: empty response", linkCount, 0, true, false
+		}
+		creatorSOL = float64(bal.Value) / 1e9
+		creatorKnown = true
+		if creatorSOL >= socialMinCreatorWithLinksSOL {
+			return true, "", linkCount, creatorSOL, true, false
+		}
+		return false, fmt.Sprintf("social-links: links>=1 but creator SOL < %.2f (marketing filter)", socialMinCreatorWithLinksSOL), linkCount, creatorSOL, true, true
+	}
+
+	if creator.Equals(zero) {
+		return false, "social-links: need >=1 link when creator unknown (links=0)", linkCount, 0, false, true
+	}
+
+	bal, err := rpcClient.GetBalance(ctx, creator, rpc.CommitmentProcessed)
+	if err != nil {
+		return false, fmt.Sprintf("social-links: creator getBalance: %v", err), linkCount, 0, true, false
+	}
+	if bal == nil {
+		return false, "social-links: creator getBalance: empty response", linkCount, 0, true, false
+	}
+	creatorSOL = float64(bal.Value) / 1e9
+	creatorKnown = true
+
+	// Без ссылок: любой ненулевой баланс создателя (в лампортах) — пропускаем (временно мягкий live-режим).
+	if bal.Value > 0 {
+		return true, "", linkCount, creatorSOL, true, false
+	}
+	return false, fmt.Sprintf("social-links: links=0 and creator SOL == 0 (need >0, ref %.2f SOL)", socialMinCreatorNoLinksSOL), linkCount, creatorSOL, true, true
 }
 
 func fetchTokenDisplayNameDexscreener(ctx context.Context, mint string) string {
