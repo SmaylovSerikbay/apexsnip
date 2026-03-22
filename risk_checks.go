@@ -3,10 +3,12 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +63,24 @@ func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEM
 func ikemeSkipVelocityWhenDexEmpty() bool { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
 // При наличии Twitter/Telegram в Dex — не требовать min volume/tx (ранний вход до «разгона» объёма).
 func ikemeRelaxVelocityWhenSocialsPresent() bool { return envIkemeBool("PUMP_IKEME_RELAX_VELOCITY_WHEN_SOCIALS", true) }
+
+// Пауза перед getTokenLargestAccounts (мс), чтобы RPC/индекс успели увидеть ATA. 0 = без паузы.
+func ikemeHoldersPreDelay() time.Duration {
+	ms := envIkemeInt("PUMP_IKEME_HOLDERS_PRE_DELAY_MS", 1000)
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// Пауза между попытками getTokenLargestAccounts (мс). По умолчанию 1000 вместо 500.
+func ikemeHoldersRetryPause() time.Duration {
+	ms := envIkemeInt("PUMP_IKEME_HOLDERS_RETRY_PAUSE_MS", 1000)
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 // pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2 с; MIN–MAX из .env).
 func pumpRiskRandomDelay() {
@@ -235,10 +255,95 @@ func passesPumpBondingCurveProgress(ctx context.Context, c *rpc.Client, mint sol
 	return true, ""
 }
 
-// getTokenLargestAccountsPump — до 4 попыток (1 + 3 ретрая по 500 ms), пока RPC не отдаст список или не исчерпаем попытки.
+// friendlyHolderRPCError — короткое сообщение в [SCAN] / REJECTED без простыни jsonrpc.
+func friendlyHolderRPCError(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if strings.Contains(s, "not a Token mint") {
+		return "getTokenLargestAccounts: not a Token mint (RPC; для Token-2022 см. fallback в логе)"
+	}
+	if len(s) > 200 {
+		return s[:197] + "..."
+	}
+	return s
+}
+
+// isRPCNotATokenMintErr — часть нод (в т.ч. Helius) отвечает -32602 «not a Token mint» на SPL Token-2022 минты (Pump.fun), хотя минт валиден.
+func isRPCNotATokenMintErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "not a Token mint") || strings.Contains(s, "-32602")
+}
+
+// splTokenAccountAmountLE — базовое поле amount (u64 LE) в SPL Token / Token-2022 account (offset 64).
+func splTokenAccountAmountLE(data []byte) (uint64, error) {
+	if len(data) < 72 {
+		return 0, fmt.Errorf("token account data len=%d", len(data))
+	}
+	return binary.LittleEndian.Uint64(data[64:72]), nil
+}
+
+// largestTokenAccountsViaProgramAccounts — обход для Token-2022: memcmp по mint @0, сортировка по amount, топ-20.
+func largestTokenAccountsViaProgramAccounts(ctx context.Context, c *rpc.Client, mint, tokenProgram solana.PublicKey) (*rpc.GetTokenLargestAccountsResult, error) {
+	filters := []rpc.RPCFilter{
+		{Memcmp: &rpc.RPCFilterMemcmp{Offset: 0, Bytes: solana.Base58(mint.Bytes())}},
+	}
+	resp, err := c.GetProgramAccountsWithOpts(ctx, tokenProgram, &rpc.GetProgramAccountsOpts{
+		Commitment: rpc.CommitmentProcessed,
+		Filters:    filters,
+	})
+	if err != nil {
+		return nil, err
+	}
+	type holder struct {
+		addr solana.PublicKey
+		amt  uint64
+	}
+	var holders []holder
+	for _, keyed := range resp {
+		if keyed == nil || keyed.Account == nil || keyed.Account.Data == nil {
+			continue
+		}
+		raw := keyed.Account.Data.GetBinary()
+		amt, err := splTokenAccountAmountLE(raw)
+		if err != nil {
+			continue
+		}
+		if amt == 0 {
+			continue
+		}
+		holders = append(holders, holder{addr: keyed.Pubkey, amt: amt})
+	}
+	if len(holders) == 0 {
+		return &rpc.GetTokenLargestAccountsResult{Value: nil}, nil
+	}
+	sort.Slice(holders, func(i, j int) bool { return holders[i].amt > holders[j].amt })
+	if len(holders) > 20 {
+		holders = holders[:20]
+	}
+	out := make([]*rpc.TokenLargestAccountsResult, 0, len(holders))
+	for _, h := range holders {
+		s := strconv.FormatUint(h.amt, 10)
+		out = append(out, &rpc.TokenLargestAccountsResult{
+			Address: h.addr,
+			UiTokenAmount: rpc.UiTokenAmount{
+				Amount:   s,
+				Decimals: 0,
+			},
+		})
+	}
+	log.Printf("[RISK] holders: getProgramAccounts fallback — %d крупнейших ATA для минта (token program %s…)", len(out), tokenProgram.String()[:8])
+	return &rpc.GetTokenLargestAccountsResult{Value: out}, nil
+}
+
+// getTokenLargestAccountsPump — getTokenLargestAccounts + ретраи; при -32602 «not a Token mint» — fallback для Token-2022 (Pump.fun).
 func getTokenLargestAccountsPump(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (*rpc.GetTokenLargestAccountsResult, error) {
 	const extraRetries = 3
-	const pause = 500 * time.Millisecond
+	pause := ikemeHoldersRetryPause()
 	var last *rpc.GetTokenLargestAccountsResult
 	var lastErr error
 	for attempt := 0; attempt <= extraRetries; attempt++ {
@@ -247,15 +352,34 @@ func getTokenLargestAccountsPump(ctx context.Context, c *rpc.Client, mint solana
 		}
 		out, err := c.GetTokenLargestAccounts(ctx, mint, rpc.CommitmentProcessed)
 		last, lastErr = out, err
-		ok := err == nil && out != nil && len(out.Value) > 0
-		if ok {
+		if err == nil && out != nil && len(out.Value) > 0 {
 			if attempt > 0 {
 				log.Printf("[RISK] holders: getTokenLargestAccounts успех после %d ретраев", attempt)
 			}
 			return out, nil
 		}
+		if isRPCNotATokenMintErr(err) {
+			log.Printf("[RISK] holders: getTokenLargestAccounts — %v; переключаемся на getProgramAccounts (часто Token-2022 / Pump)", err)
+			tokProg, e2 := mintTokenProgram(ctx, c, mint)
+			if e2 != nil {
+				return nil, fmt.Errorf("mint token program: %w", e2)
+			}
+			return largestTokenAccountsViaProgramAccounts(ctx, c, mint, tokProg)
+		}
 		if attempt < extraRetries {
 			log.Printf("[RISK] holders: getTokenLargestAccounts пусто/ошибка (попытка %d/%d): %v — повтор через %v…", attempt+1, extraRetries+1, err, pause)
+		}
+	}
+	// Пустой ответ без ошибки — иногда лаг RPC; пробуем тот же обход через program accounts
+	if lastErr == nil && (last == nil || len(last.Value) == 0) {
+		log.Printf("[RISK] holders: getTokenLargestAccounts пусто после ретраев — пробуем getProgramAccounts")
+		tokProg, e2 := mintTokenProgram(ctx, c, mint)
+		if e2 == nil {
+			if alt, e3 := largestTokenAccountsViaProgramAccounts(ctx, c, mint, tokProg); e3 == nil && alt != nil && len(alt.Value) > 0 {
+				return alt, nil
+			} else if e3 != nil {
+				log.Printf("[RISK] holders: fallback getProgramAccounts: %v", e3)
+			}
 		}
 	}
 	return last, lastErr
@@ -286,9 +410,13 @@ func passesPumpTopHolderConcentration(ctx context.Context, c *rpc.Client, mint s
 	if err != nil {
 		return false, fmt.Sprintf("holders: assoc BC: %v", err)
 	}
+	if d := ikemeHoldersPreDelay(); d > 0 {
+		log.Printf("[RISK] holders: пауза %v перед getTokenLargestAccounts (индексация RPC / ATA)…", d)
+		time.Sleep(d)
+	}
 	largest, err := getTokenLargestAccountsPump(ctx, c, mint)
 	if err != nil {
-		return false, fmt.Sprintf("holders: getTokenLargestAccounts error: %v", err)
+		return false, "holders: " + friendlyHolderRPCError(err)
 	}
 	if largest == nil || len(largest.Value) == 0 {
 		return false, "holders: getTokenLargestAccounts empty after retries"
