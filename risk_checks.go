@@ -84,7 +84,7 @@ func ikemeHoldersRetryPause() time.Duration {
 
 // Если getProgramAccounts вернул «слишком много аккаунтов», пропускаем концентрацию холдеров при curve ≥ этого % (хайп / много мелких ATA).
 func ikemeHoldersHypePassCurvePct() float64 {
-	return envIkemeFloat("PUMP_IKEME_HOLDERS_HYPE_PASS_CURVE_PCT", 70)
+	return envIkemeFloat("PUMP_IKEME_HOLDERS_HYPE_PASS_CURVE_PCT", 40)
 }
 
 // pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2 с; MIN–MAX из .env).
