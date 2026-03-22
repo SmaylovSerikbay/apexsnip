@@ -78,9 +78,9 @@ const (
 // Pump create (IDL): минимум SOL у создателя — зависит от соцссылок (Dexscreener).
 const (
 	pumpCreateUserAccountIndex = 7 // accounts[7] = user (signer)
-	// Без соцссылок (links=0): минимум SOL у создателя.
-	pumpMinCreatorLamports = uint64(10_000_000) // 0.01 SOL
-	// При ≥1 соцссылке (twitter/telegram в Dexscreener).
+	// Без соцссылок (links=0): жёсткий порог.
+	pumpMinCreatorLamports = uint64(20_000_000) // 0.02 SOL
+	// При ≥1 соцссылке (twitter/telegram в Dexscreener): мягче.
 	pumpMinCreatorLamportsWithSocial = uint64(10_000_000) // 0.01 SOL
 )
 
@@ -94,10 +94,10 @@ const (
 // BUY_LAMPORTS — размер «покупки» в лампортах (0.05 SOL по умолчанию).
 const BUY_LAMPORTS uint64 = 50_000_000
 
-// slippageBps / priorityFeeLamports — для live: дефолт 25% (лимит min_out); без экстремальных 80–90%; переопределяются SLIPPAGE_BPS и PRIORITY_FEE_LAMPORTS в .env.
+// slippageBps / priorityFeeLamports — для live: дефолт 25% (лимит min_out на чейне) и ~0.001 SOL; переопределяются SLIPPAGE_BPS и PRIORITY_FEE_LAMPORTS в .env.
 var (
-	slippageBps         uint64 = 2500 // 25% = 2500 bps
-	priorityFeeLamports uint64 = 3_000_000 // 0.003 SOL
+	slippageBps         uint64 = 2500 // 25% = 2500 bps (не «потеря 25%», а допустимое проскальзывание min_out)
+	priorityFeeLamports uint64 = 1_000_000
 )
 
 // MinMicroLamportsPerCU — нижняя граница цены за CU (рекомендация валидаторов / конкуренция в мемпуле).
@@ -265,7 +265,7 @@ func loadDotEnv() {
 	}
 }
 
-// applyTradingEnvFromEnv — SLIPPAGE_BPS (50–5000, 2500=25%), PRIORITY_FEE_LAMPORTS (мин. 5000 lamports).
+// applyTradingEnvFromEnv — SLIPPAGE_BPS (50–5000), PRIORITY_FEE_LAMPORTS (мин. 5000 lamports).
 func applyTradingEnvFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("SLIPPAGE_BPS")); s != "" {
 		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v >= 50 && v <= 5000 {
@@ -1351,7 +1351,6 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 		startExitTracker(mint.String())
 		return
 	}
-	fmt.Printf("[ATTEMPT] Buying %s with %.0f%% slippage...\n", mint.String(), float64(slippageBps)/100.0)
 	buySig, err := swapPumpFun(ctx, rpcClient, wallet, mint, BUY_LAMPORTS)
 	if err != nil {
 		logPumpScanResult(mint.String(), sigStr, false, fmt.Sprintf("live swapPumpFun: %v", err))

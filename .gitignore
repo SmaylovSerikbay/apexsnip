@@ -1,14 +1,4 @@
-# Секретные ключи и конфиги
 .env
-
-# Исполняемые файлы (Windows и Linux)
 *.exe
-sniper
-apexsnip
-
-# Логи работы
 snipes.log
-*.log
-
-# Папка с зависимостями (если не хочешь пушить vendor)
-# vendor/
+.env
