@@ -111,15 +111,11 @@ const (
 	jupiterPricePrimary  = "https://lite-api.jup.ag/price/v3?ids="
 	jupiterPriceFallback = "https://api.jup.ag/price/v2?ids="
 	pricePollInterval    = 2 * time.Second
-	// targetSL для новых позиций: −35% от цены входа.
+	// targetSL для новых позиций: −35% от цены входа (до включения трейлинга).
 	targetStopLossMultiplier = 0.65
-	// Moonshot: при PnL ≥ +100% (цена ≥ 2x entry) — продать 50% (swapOut в симуляции).
-	moonshotPnL100Multiplier = 2.0 // +100% PnL = 2x
-	// После moonshot: targetTP не задаём (рост «бесконечный»); только targetSL по HWM.
-	trailingBreakevenPlusMultiplier = 1.10 // при HWM с PnL≥+100%: targetSL на +10% (безубыток)
-	trailingLock100PctMultiplier    = 2.00 // при PnL ≥ +200% по пику: SL на +100% от входа (цена 2x)
-	trailingProfitTier100Multiplier = 2.00 // HWM даёт PnL ≥ +100%
-	trailingProfitTier200Multiplier = 3.00 // HWM даёт PnL ≥ +200% (цена 3x)
+	// Live Pump: трейлинг от пика после +20% PnL; откат от HWM — закрытие.
+	livePumpTrailingArmPnLPct       = 20.0
+	livePumpTrailingDrawdownFromHWM = 0.20 // 20% ниже пика
 )
 
 // snipesLogFile — журнал сделок (BUY/SELL), без шума в консоли.
@@ -222,13 +218,14 @@ var (
 
 type simPosition struct {
 	EntryUSD          float64
-	OpenedAt          time.Time // для удержания / time-exit
-	LastAPIPriceOKAt  time.Time // последний успешный ответ Dex или Jupiter (не кеш)
-	LastKnownPriceUSD float64   // последняя цена с API (для MTM / stale exit)
+	OpenedAt          time.Time
+	LastAPIPriceOKAt  time.Time
+	LastKnownPriceUSD float64
 	NotionalUSD       float64
 	RemainingFraction float64
-	DidMoonshotHalf   bool    // после продажи 50% на 2x
-	HighWaterMark     float64 // пиковая цена (USD) для trailing
+	DidMoonshotHalf   bool // legacy: симуляция раньше продавала 50% на 2x; см. monitorPosition
+	HighWaterMark     float64
+	TrailingArmed     bool // после +20% PnL — трейлинг от пика
 }
 
 const (
@@ -823,6 +820,7 @@ func reportSimulationBuy(mint string, entryUSD float64) bool {
 		RemainingFraction: 1.0,
 		DidMoonshotHalf:   false,
 		HighWaterMark:     0,
+		TrailingArmed:     false,
 	}
 	simLastQuotedPriceUSD.Store(mint, entryUSD)
 	cashAfter := simCashUSD
@@ -885,7 +883,7 @@ func reportSimulationSell(mint, reason string, entry, exit, soldFraction float64
 		simMu.Unlock()
 
 		switch reason {
-		case "TAKE_PROFIT", "TRAILING_STOP":
+		case "TAKE_PROFIT", "TAKE_PROFIT_2X", "TRAILING_STOP":
 			simTakeProfitHits.Add(1)
 		case "STOP_LOSS":
 			simStopLossHits.Add(1)
@@ -1314,26 +1312,14 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 	}
 	fmt.Printf("[SCAN] Checking mint: %s…\n", mintStr)
 
-	linkCountForRisk := 0
-	if body, err := fetchDexscreenerTokenPairs(ctx, mint.String()); err == nil {
-		linkCountForRisk = countTwitterTelegramLinks(&body, mint.String())
-	}
-	minCreatorLamports := pumpMinCreatorLamports
-	if linkCountForRisk >= 1 {
-		minCreatorLamports = pumpMinCreatorLamportsWithSocial
-	}
-	if ok, why := passesMintSecurity(ctx, rpcClient, mint, pumpDev, minCreatorLamports); !ok {
+	if ok, why := passesMintSecurity(ctx, rpcClient, mint, pumpDev, pumpMinCreatorLamports); !ok {
 		logPumpScanResult(mint.String(), sigStr, false, "risk-check: "+why)
 		logRejected(mint.String(), fmt.Sprintf("[PUMP] risk-check: %s", why))
 		return
 	}
-	if ok, why, links, creSOL, creKnown, pot := isSocialSafe(ctx, rpcClient, mint.String(), pumpDev); !ok {
-		logPumpScanResult(mint.String(), sigStr, false, "social filter: "+why)
-		if pot {
-			logRejectedSocial(mint.String(), "[PUMP] "+why, links, creSOL, creKnown)
-		} else {
-			logRejected(mint.String(), "[PUMP] "+why)
-		}
+	if ok, why := passesPumpIkemeRisk(ctx, rpcClient, mint); !ok {
+		logPumpScanResult(mint.String(), sigStr, false, "ikeme-risk: "+why)
+		logRejected(mint.String(), fmt.Sprintf("[PUMP] ikeme-risk: %s", why))
 		return
 	}
 
@@ -2283,25 +2269,8 @@ func positionPnLPercent(entry, price float64) float64 {
 	return (price/entry - 1) * 100
 }
 
-// trailingStopPriceUSD — после продажи 50% на +100% PnL: верх не ограничен (нет targetTP).
-// HWM с PnL≥+200% → targetSL на +100% к входу (цена 2× entry); HWM с PnL≥+100% → targetSL +10%; иначе начальный targetSL −35%.
-func trailingStopPriceUSD(entry, hwm float64, afterMoonshot bool) float64 {
-	if !afterMoonshot {
-		return entry * targetStopLossMultiplier
-	}
-	if hwm >= entry*trailingProfitTier200Multiplier {
-		return entry * trailingLock100PctMultiplier
-	}
-	if hwm >= entry*trailingProfitTier100Multiplier {
-		return entry * trailingBreakevenPlusMultiplier
-	}
-	return entry * targetStopLossMultiplier
-}
-
-// monitorPosition — стратегия «2x–3x Moonshot» (симуляция):
-// − Начальный targetSL: −35% от entry.
-// − При PnL +100% (2×): продать ровно 50% позиции; targetTP снимаем (рост без потолка); новый targetSL по HWM → +10% к входу после достижения 2× по пику.
-// − При PnL +200% по пику (HWM ≥ 3× entry): подтянуть targetSL на +100% к входу (цена выхода 2× entry).
+// monitorPosition — симуляция: TP +100% (полный выход), без выхода по времени.
+// До +20% PnL — только стоп −35%; после +20% — трейлинг от пика (−20% от HWM).
 func monitorPosition(mint string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
@@ -2314,8 +2283,6 @@ func monitorPosition(mint string) bool {
 		return true
 	}
 	entryUSD := pos.EntryUSD
-	openedAt := pos.OpenedAt
-	didMoon := pos.DidMoonshotHalf
 	remaining := pos.RemainingFraction
 
 	if err == nil && price > 0 {
@@ -2326,71 +2293,49 @@ func monitorPosition(mint string) bool {
 		}
 	}
 	hwm := pos.HighWaterMark
-	lastAPI := pos.LastAPIPriceOKAt
-	lastKnown := pos.LastKnownPriceUSD
+	trailingArmed := pos.TrailingArmed
 	simMu.Unlock()
 
 	if err != nil || price <= 0 {
-		ref := lastAPI
-		if ref.IsZero() && !openedAt.IsZero() {
-			ref = openedAt
-		}
-		if !ref.IsZero() && time.Since(ref) >= simStalePriceExitDuration && remaining > 0 {
-			exitPx := lastKnown
-			if exitPx <= 0 {
-				exitPx = entryUSD
-			}
-			fmt.Printf("[TIME EXIT] [STALE DATA] No fresh quote for %s (>= %v since last API) — closing as illiquid | exit_price=%.10f\n",
-				mint, simStalePriceExitDuration, exitPx)
-			reportSimulationSell(mint, "TIME_EXIT_STALE", entryUSD, exitPx, remaining)
-			return true
-		}
 		return false
 	}
 
 	p := price
-	// PnL в %: (текущая_цена/вход - 1) * 100 — корректно для long в USD/token.
 	pnl := positionPnLPercent(entryUSD, p)
 
-	// Time-based exit: >12 мин и «флэт» −3%…+3% — закрыть остаток по рынку (симуляция).
-	if !openedAt.IsZero() && time.Since(openedAt) >= simTimeExitHoldDuration {
-		if pnl >= simTimeExitFlatMinPct && pnl <= simTimeExitFlatMaxPct && remaining > 0 {
-			fmt.Printf("[TIME EXIT] Closing stagnant position %s | PnL: %.1f%%\n", mint, pnl)
-			reportSimulationSell(mint, "TIME_EXIT", entryUSD, p, remaining)
-			return true
-		}
+	if pnl >= 100 && remaining > 0 {
+		reportSimulationSell(mint, "TAKE_PROFIT_2X", entryUSD, p, remaining)
+		return true
 	}
 
-	if !didMoon {
-		// До первой фиксации: только начальный targetSL (−35%).
+	simMu.Lock()
+	if pos2 := simOpenPositions[mint]; pos2 != nil && !pos2.TrailingArmed && pnl >= livePumpTrailingArmPnLPct && pnl < 100 {
+		pos2.TrailingArmed = true
+		if p > pos2.HighWaterMark {
+			pos2.HighWaterMark = p
+		}
+	}
+	if pos2 := simOpenPositions[mint]; pos2 != nil {
+		hwm = pos2.HighWaterMark
+		trailingArmed = pos2.TrailingArmed
+	}
+	simMu.Unlock()
+
+	if !trailingArmed {
 		if p <= entryUSD*targetStopLossMultiplier {
 			reportSimulationSell(mint, "STOP_LOSS", entryUSD, p, remaining)
 			return true
 		}
-		// PnL ≥ +100% → 50% swapOut (в live здесь был бы реальный swap).
-		if positionPnLPercent(entryUSD, p) >= 100 && remaining >= 1.0 {
-			reportSimulationSell(mint, "MOONSHOT_PARTIAL", entryUSD, p, 0.5)
-			simMu.Lock()
-			if p2 := simOpenPositions[mint]; p2 != nil {
-				p2.DidMoonshotHalf = true
-				if p > p2.HighWaterMark {
-					p2.HighWaterMark = p
-				}
-			}
-			simMu.Unlock()
-			return false
-		}
 		return false
 	}
 
-	// Остаток: без фиксированного TP; только динамический targetSL по HWM.
-	stopPx := trailingStopPriceUSD(entryUSD, hwm, true)
-	if p <= stopPx {
-		reason := "TRAILING_STOP"
-		if stopPx <= entryUSD*targetStopLossMultiplier+1e-15 {
-			reason = "STOP_LOSS"
-		}
-		reportSimulationSell(mint, reason, entryUSD, p, remaining)
+	trailFloor := hwm * (1.0 - livePumpTrailingDrawdownFromHWM)
+	if p <= trailFloor {
+		reportSimulationSell(mint, "TRAILING_STOP", entryUSD, p, remaining)
+		return true
+	}
+	if p <= entryUSD*targetStopLossMultiplier {
+		reportSimulationSell(mint, "STOP_LOSS", entryUSD, p, remaining)
 		return true
 	}
 	return false
@@ -2442,7 +2387,7 @@ func simPeriodicPositionLogs(ctx context.Context) {
 					continue
 				}
 				entry := pos.EntryUSD
-				half := pos.DidMoonshotHalf
+				half := pos.TrailingArmed
 				if err == nil && price > 0 {
 					pos.LastAPIPriceOKAt = time.Now()
 					pos.LastKnownPriceUSD = price
@@ -2459,11 +2404,11 @@ func simPeriodicPositionLogs(ctx context.Context) {
 					fmt.Printf("[DEBUG] Mint: %s PnL: %.1f%%\n", mint, pnl)
 				}
 				if n%15 == 0 {
-					halfStr := "No"
+					trailStr := "No"
 					if half {
-						halfStr = "Yes"
+						trailStr = "Yes"
 					}
-					fmt.Printf("STATUS: %s | Price: %.10f | PnL: %.1f%% | HalfSold: %s\n", mint, price, pnl, halfStr)
+					fmt.Printf("STATUS: %s | Price: %.10f | PnL: %.1f%% | TrailingArmed: %s\n", mint, price, pnl, trailStr)
 				}
 			}
 		}
@@ -2591,30 +2536,50 @@ func notifyNewTokenFoundWhatsApp(mint string) {
 	SendWA(fmt.Sprintf("💎 New Token Found: %s | %s | %s", name, mint, dex))
 }
 
+// dexscreenerPair — фрагмент ответа api.dexscreener.com/latest/dex/tokens/:mint (volume/txns для risk-check).
+type dexscreenerPair struct {
+	DexID     string      `json:"dexId"`
+	PriceUsd  interface{} `json:"priceUsd"`
+	Liquidity struct {
+		Usd float64 `json:"usd"`
+	} `json:"liquidity"`
+	Volume struct {
+		M5  float64 `json:"m5"`
+		M15 float64 `json:"m15"`
+		H1  float64 `json:"h1"`
+		H6  float64 `json:"h6"`
+		H24 float64 `json:"h24"`
+	} `json:"volume"`
+	Txns struct {
+		M5 struct {
+			Buys  int `json:"buys"`
+			Sells int `json:"sells"`
+		} `json:"m5"`
+		H1 struct {
+			Buys  int `json:"buys"`
+			Sells int `json:"sells"`
+		} `json:"h1"`
+	} `json:"txns"`
+	BaseToken struct {
+		Address string `json:"address"`
+		Name    string `json:"name"`
+		Symbol  string `json:"symbol"`
+	} `json:"baseToken"`
+	QuoteToken struct {
+		Address string `json:"address"`
+		Name    string `json:"name"`
+		Symbol  string `json:"symbol"`
+	} `json:"quoteToken"`
+	Info struct {
+		Socials []struct {
+			Type string `json:"type"`
+			URL  string `json:"url"`
+		} `json:"socials"`
+	} `json:"info"`
+}
+
 type dexscreenerTokenPairs struct {
-	Pairs []struct {
-		DexID     string `json:"dexId"`
-		PriceUsd  interface{} `json:"priceUsd"` // string или number в ответе API
-		Liquidity struct {
-			Usd float64 `json:"usd"`
-		} `json:"liquidity"`
-		BaseToken struct {
-			Address string `json:"address"`
-			Name    string `json:"name"`
-			Symbol  string `json:"symbol"`
-		} `json:"baseToken"`
-		QuoteToken struct {
-			Address string `json:"address"`
-			Name    string `json:"name"`
-			Symbol  string `json:"symbol"`
-		} `json:"quoteToken"`
-		Info struct {
-			Socials []struct {
-				Type string `json:"type"`
-				URL  string `json:"url"`
-			} `json:"socials"`
-		} `json:"info"`
-	} `json:"pairs"`
+	Pairs []dexscreenerPair `json:"pairs"`
 }
 
 // dexscreenerPumpFunAndMaxLiquidityUSD — один запрос: есть ли пара pump.fun и макс. liquidity.usd по mint.

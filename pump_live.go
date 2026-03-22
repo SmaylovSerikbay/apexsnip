@@ -46,8 +46,9 @@ type livePumpPosition struct {
 	LastAPIPriceOKAt  time.Time
 	LastKnownPriceUSD float64
 	RemainingFraction float64
-	DidMoonshotHalf   bool
+	DidMoonshotHalf   bool // legacy симуляции; live: не используется
 	HighWaterMark     float64
+	TrailingArmed     bool // после +20% PnL — трейлинг-стоп от пика
 }
 
 func derivePumpGlobal() (solana.PublicKey, uint8, error) {
@@ -129,6 +130,15 @@ func parsePumpGlobalFees(data []byte) (feeRecipient solana.PublicKey, feeBps, cr
 	off += 8  // pool_migration_fee
 	creatorFeeBps = binary.LittleEndian.Uint64(data[off : off+8])
 	return feeRecipient, feeBps, creatorFeeBps, nil
+}
+
+// parsePumpGlobalInitialRealTokenReserves — initial_real_token_reserves из Global (IDL: после fee_recipient идут 4×u64).
+func parsePumpGlobalInitialRealTokenReserves(data []byte) (uint64, error) {
+	if len(data) < 97 {
+		return 0, fmt.Errorf("global data too short for initial_real")
+	}
+	// off 8: init; +32 auth; +32 fee_recipient; +8 virt tok; +8 virt sol; +8 initial_real
+	return binary.LittleEndian.Uint64(data[89:97]), nil
 }
 
 // pumpQuoteExpectedTokensBuyExactSolIn — формула из IDL buy_exact_sol_in.
@@ -550,6 +560,7 @@ func registerLivePumpBuy(mint string, entryUSD float64) {
 		RemainingFraction: 1.0,
 		DidMoonshotHalf:   false,
 		HighWaterMark:     0,
+		TrailingArmed:     false,
 	}
 }
 
@@ -602,8 +613,6 @@ func monitorLivePumpOnce(ctx context.Context, rpcClient *rpc.Client, wallet sola
 		return true
 	}
 	entryUSD := pos.EntryUSD
-	openedAt := pos.OpenedAt
-	didMoon := pos.DidMoonshotHalf
 	rem := pos.RemainingFraction
 
 	if err == nil && price > 0 {
@@ -614,7 +623,7 @@ func monitorLivePumpOnce(ctx context.Context, rpcClient *rpc.Client, wallet sola
 		}
 	}
 	hwm := pos.HighWaterMark
-	lastAPI := pos.LastAPIPriceOKAt
+	trailingArmed := pos.TrailingArmed
 	livePumpMu.Unlock()
 
 	mintPK, errPK := solana.PublicKeyFromBase58(mintStr)
@@ -624,67 +633,58 @@ func monitorLivePumpOnce(ctx context.Context, rpcClient *rpc.Client, wallet sola
 	}
 
 	if err != nil || price <= 0 {
-		ref := lastAPI
-		if ref.IsZero() && !openedAt.IsZero() {
-			ref = openedAt
-		}
-		if !ref.IsZero() && time.Since(ref) >= simStalePriceExitDuration && rem > 0 {
-			log.Printf("[LIVE PUMP] TIME_EXIT_STALE %s — closing", mintStr)
-			if _, e := swapPumpFunSellAll(pctx, rpcClient, wallet, mintPK, slippageBps); e != nil {
-				log.Printf("[LIVE PUMP] stale exit sell failed: %v", e)
-			}
-			deleteLivePump(mintStr)
-			return true
-		}
 		return false
 	}
 
 	pnl := positionPnLPercent(entryUSD, price)
 
-	if !openedAt.IsZero() && time.Since(openedAt) >= simTimeExitHoldDuration {
-		if pnl >= simTimeExitFlatMinPct && pnl <= simTimeExitFlatMaxPct && rem > 0 {
-			log.Printf("[LIVE PUMP] TIME_EXIT flat %s pnl=%.2f%%", mintStr, pnl)
-			if _, e := swapPumpFunSellFraction(pctx, rpcClient, wallet, mintPK, rem, slippageBps); e != nil {
-				log.Printf("[LIVE PUMP] time exit sell failed: %v", e)
-			}
-			deleteLivePump(mintStr)
-			return true
+	if pnl >= 100 && rem > 0 {
+		log.Printf("[LIVE PUMP] TAKE_PROFIT_2X %s pnl=%.2f%%", mintStr, pnl)
+		if _, e := swapPumpFunSellAll(pctx, rpcClient, wallet, mintPK, slippageBps); e != nil {
+			log.Printf("[LIVE PUMP] TP sell failed: %v", e)
 		}
+		deleteLivePump(mintStr)
+		return true
 	}
 
-	if !didMoon {
+	livePumpMu.Lock()
+	if p2 := livePumpOpenPositions[mintStr]; p2 != nil && !p2.TrailingArmed && pnl >= livePumpTrailingArmPnLPct && pnl < 100 {
+		p2.TrailingArmed = true
+		if price > p2.HighWaterMark {
+			p2.HighWaterMark = price
+		}
+	}
+	if p2 := livePumpOpenPositions[mintStr]; p2 != nil {
+		hwm = p2.HighWaterMark
+		trailingArmed = p2.TrailingArmed
+	}
+	livePumpMu.Unlock()
+
+	if !trailingArmed {
 		if price <= entryUSD*targetStopLossMultiplier {
 			log.Printf("[LIVE PUMP] STOP_LOSS %s", mintStr)
-			if _, e := swapPumpFunSellFraction(pctx, rpcClient, wallet, mintPK, rem, slippageBps); e != nil {
+			if _, e := swapPumpFunSellAll(pctx, rpcClient, wallet, mintPK, slippageBps); e != nil {
 				log.Printf("[LIVE PUMP] SL sell failed: %v", e)
 			}
 			deleteLivePump(mintStr)
 			return true
 		}
-		if positionPnLPercent(entryUSD, price) >= 100 && rem >= 1.0 {
-			log.Printf("[LIVE PUMP] MOONSHOT 50%% %s", mintStr)
-			if _, e := swapPumpFunSellFraction(pctx, rpcClient, wallet, mintPK, 0.5, slippageBps); e != nil {
-				log.Printf("[LIVE PUMP] moonshot sell failed: %v", e)
-			}
-			livePumpMu.Lock()
-			if p2 := livePumpOpenPositions[mintStr]; p2 != nil {
-				p2.DidMoonshotHalf = true
-				p2.RemainingFraction = 0.5
-				if price > p2.HighWaterMark {
-					p2.HighWaterMark = price
-				}
-			}
-			livePumpMu.Unlock()
-			return false
-		}
 		return false
 	}
 
-	stopPx := trailingStopPriceUSD(entryUSD, hwm, true)
-	if price <= stopPx {
-		log.Printf("[LIVE PUMP] TRAILING/SL %s", mintStr)
-		if _, e := swapPumpFunSellFraction(pctx, rpcClient, wallet, mintPK, rem, slippageBps); e != nil {
+	trailFloor := hwm * (1.0 - livePumpTrailingDrawdownFromHWM)
+	if price <= trailFloor {
+		log.Printf("[LIVE PUMP] TRAILING_STOP %s (floor vs price)", mintStr)
+		if _, e := swapPumpFunSellAll(pctx, rpcClient, wallet, mintPK, slippageBps); e != nil {
 			log.Printf("[LIVE PUMP] trailing sell failed: %v", e)
+		}
+		deleteLivePump(mintStr)
+		return true
+	}
+	if price <= entryUSD*targetStopLossMultiplier {
+		log.Printf("[LIVE PUMP] STOP_LOSS (hard) %s", mintStr)
+		if _, e := swapPumpFunSellAll(pctx, rpcClient, wallet, mintPK, slippageBps); e != nil {
+			log.Printf("[LIVE PUMP] SL sell failed: %v", e)
 		}
 		deleteLivePump(mintStr)
 		return true
