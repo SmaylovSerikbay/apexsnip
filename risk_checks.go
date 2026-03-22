@@ -82,6 +82,11 @@ func ikemeHoldersRetryPause() time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
+// Если getProgramAccounts вернул «слишком много аккаунтов», пропускаем концентрацию холдеров при curve ≥ этого % (хайп / много мелких ATA).
+func ikemeHoldersHypePassCurvePct() float64 {
+	return envIkemeFloat("PUMP_IKEME_HOLDERS_HYPE_PASS_CURVE_PCT", 70)
+}
+
 // pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2 с; MIN–MAX из .env).
 func pumpRiskRandomDelay() {
 	minS, maxS := ikemeDelayMinSec(), ikemeDelayMaxSec()
@@ -270,6 +275,17 @@ func friendlyHolderRPCError(err error) string {
 	return s
 }
 
+// isRPCTooManyAccountsErr — лимит RPC (Helius: getProgramAccounts слишком много ATA по одному минту).
+func isRPCTooManyAccountsErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "Too many accounts") ||
+		strings.Contains(s, "-32600") ||
+		strings.Contains(s, "Large number of pubkeys")
+}
+
 // isRPCNotATokenMintErr — часть нод (в т.ч. Helius) отвечает -32602 «not a Token mint» на SPL Token-2022 минты (Pump.fun), хотя минт валиден.
 func isRPCNotATokenMintErr(err error) bool {
 	if err == nil {
@@ -375,10 +391,13 @@ func getTokenLargestAccountsPump(ctx context.Context, c *rpc.Client, mint solana
 		log.Printf("[RISK] holders: getTokenLargestAccounts пусто после ретраев — пробуем getProgramAccounts")
 		tokProg, e2 := mintTokenProgram(ctx, c, mint)
 		if e2 == nil {
-			if alt, e3 := largestTokenAccountsViaProgramAccounts(ctx, c, mint, tokProg); e3 == nil && alt != nil && len(alt.Value) > 0 {
+			alt, e3 := largestTokenAccountsViaProgramAccounts(ctx, c, mint, tokProg)
+			if e3 == nil && alt != nil && len(alt.Value) > 0 {
 				return alt, nil
-			} else if e3 != nil {
+			}
+			if e3 != nil {
 				log.Printf("[RISK] holders: fallback getProgramAccounts: %v", e3)
+				return nil, e3
 			}
 		}
 	}
@@ -416,6 +435,19 @@ func passesPumpTopHolderConcentration(ctx context.Context, c *rpc.Client, mint s
 	}
 	largest, err := getTokenLargestAccountsPump(ctx, c, mint)
 	if err != nil {
+		// Invalid param (-32602) и прочие ошибки — без обхода. Только «Too many accounts» (-32600): хайп, при высоком % кривой пропускаем концентрацию.
+		if isRPCTooManyAccountsErr(err) {
+			pct, e2 := ComputePumpBondingCurveSoldPct(ctx, c, mint)
+			if e2 != nil {
+				return false, fmt.Sprintf("holders: too many accounts (RPC) and curve: %v", e2)
+			}
+			minHype := ikemeHoldersHypePassCurvePct()
+			if pct >= minHype {
+				log.Printf("[RISK] holders: слишком много ATA по RPC (хайп) — пропуск проверки концентрации при curve %.2f%% ≥ %.1f%%", pct, minHype)
+				return true, ""
+			}
+			return false, fmt.Sprintf("holders: too many accounts (RPC), curve %.2f%% < %.1f%% (нужен порог для хайпа)", pct, minHype)
+		}
 		return false, "holders: " + friendlyHolderRPCError(err)
 	}
 	if largest == nil || len(largest.Value) == 0 {
