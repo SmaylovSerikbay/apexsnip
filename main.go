@@ -94,9 +94,9 @@ const (
 // BUY_LAMPORTS — размер «покупки» в лампортах (0.05 SOL по умолчанию).
 const BUY_LAMPORTS uint64 = 50_000_000
 
-// slippageBps / priorityFeeLamports — для live: дефолт 40% (лимит min_out) и ~0.003 SOL; переопределяются SLIPPAGE_BPS и PRIORITY_FEE_LAMPORTS в .env.
+// slippageBps / priorityFeeLamports — для live: дефолт 25% (лимит min_out); без экстремальных 80–90%; переопределяются SLIPPAGE_BPS и PRIORITY_FEE_LAMPORTS в .env.
 var (
-	slippageBps         uint64 = 4000 // 40% = 4000 bps (допустимое проскальзывание min_out, не гарантированная потеря)
+	slippageBps         uint64 = 2500 // 25% = 2500 bps
 	priorityFeeLamports uint64 = 3_000_000 // 0.003 SOL
 )
 
@@ -265,7 +265,7 @@ func loadDotEnv() {
 	}
 }
 
-// applyTradingEnvFromEnv — SLIPPAGE_BPS (50–5000, 4000=40%), PRIORITY_FEE_LAMPORTS (мин. 5000 lamports).
+// applyTradingEnvFromEnv — SLIPPAGE_BPS (50–5000, 2500=25%), PRIORITY_FEE_LAMPORTS (мин. 5000 lamports).
 func applyTradingEnvFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("SLIPPAGE_BPS")); s != "" {
 		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v >= 50 && v <= 5000 {
