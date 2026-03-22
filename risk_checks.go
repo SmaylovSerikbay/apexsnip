@@ -59,7 +59,8 @@ func ikemeDelayMaxSec() int                      { return envIkemeInt("PUMP_IKEM
 func ikemeMinVolumeUSD() float64               { return envIkemeFloat("PUMP_IKEME_MIN_VOLUME_USD", 0) }
 func ikemeMinTxEvents() int                    { return envIkemeInt("PUMP_IKEME_MIN_TX_EVENTS", 0) }
 func ikemeMaxNonCurveHolderPct() float64       { return envIkemeFloat("PUMP_IKEME_MAX_HOLDER_PCT", 30) }
-func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0.8) }
+// 0 = не требовать мин. прогресс кривой (ранний вход; иначе 0.8 и т.д. режет свежие минты).
+func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0) }
 func ikemeSkipVelocityWhenDexEmpty() bool { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
 // При наличии Twitter/Telegram в Dex — не требовать min volume/tx (ранний вход до «разгона» объёма).
 func ikemeRelaxVelocityWhenSocialsPresent() bool { return envIkemeBool("PUMP_IKEME_RELAX_VELOCITY_WHEN_SOCIALS", true) }
@@ -84,7 +85,8 @@ func ikemeHoldersRetryPause() time.Duration {
 
 // Если getProgramAccounts вернул «слишком много аккаунтов», пропускаем концентрацию холдеров при curve ≥ этого % (хайп / много мелких ATA).
 func ikemeHoldersHypePassCurvePct() float64 {
-	return envIkemeFloat("PUMP_IKEME_HOLDERS_HYPE_PASS_CURVE_PCT", 40)
+	// При Too many accounts: пропуск холдеров если curve ≥ N% (ниже = больше сделок при RPC-лимите).
+	return envIkemeFloat("PUMP_IKEME_HOLDERS_HYPE_PASS_CURVE_PCT", 5)
 }
 
 // pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2 с; MIN–MAX из .env).
@@ -243,7 +245,7 @@ func ComputePumpBondingCurveSoldPct(ctx context.Context, c *rpc.Client, mint sol
 }
 
 // passesPumpBondingCurveProgress — прогресс кривой: (initial_real - real_token) / initial_real >= minPct.
-// По умолчанию min 0.8% — раньше вход, чем «идеальная» кривая; 0 = выключить.
+// По умолчанию min 0 (выкл.); задать в .env, например 0.8, чтобы резать совсем сырые кривые.
 // PUMP_IKEME_MIN_CURVE_PROGRESS_PCT <= 0 — проверка отключена.
 func passesPumpBondingCurveProgress(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
 	minPct := ikemeMinBondingCurveProgressPct()
