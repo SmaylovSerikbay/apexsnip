@@ -88,8 +88,8 @@ const (
 	ansiReset = "\x1b[0m"
 )
 
-// BUY_LAMPORTS — размер «покупки» в лампортах (0.05 SOL по умолчанию).
-const BUY_LAMPORTS uint64 = 50_000_000
+// BUY_LAMPORTS — фиксированный размер покупки в лампортах (0.01 SOL), независимо от баланса кошелька.
+const BUY_LAMPORTS uint64 = 10_000_000
 
 // slippageBps / priorityFeeLamports — для live: дефолт 40% и 0.003 SOL; переопределяются SLIPPAGE_BPS и PRIORITY_FEE_LAMPORTS в .env.
 var (

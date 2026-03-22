@@ -58,8 +58,7 @@ func ikemeMinVolumeUSD() float64               { return envIkemeFloat("PUMP_IKEM
 func ikemeMinTxEvents() int                    { return envIkemeInt("PUMP_IKEME_MIN_TX_EVENTS", 0) }
 func ikemeMaxNonCurveHolderPct() float64       { return envIkemeFloat("PUMP_IKEME_MAX_HOLDER_PCT", 30) }
 func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0.8) }
-func ikemeSkipVelocityWhenDexEmpty() bool       { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
-func ikemeSkipHoldersWhenLargestEmpty() bool     { return envIkemeBool("PUMP_IKEME_SKIP_HOLDERS_WHEN_LARGEST_EMPTY", true) }
+func ikemeSkipVelocityWhenDexEmpty() bool { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
 // При наличии Twitter/Telegram в Dex — не требовать min volume/tx (ранний вход до «разгона» объёма).
 func ikemeRelaxVelocityWhenSocialsPresent() bool { return envIkemeBool("PUMP_IKEME_RELAX_VELOCITY_WHEN_SOCIALS", true) }
 
@@ -288,12 +287,11 @@ func passesPumpTopHolderConcentration(ctx context.Context, c *rpc.Client, mint s
 		return false, fmt.Sprintf("holders: assoc BC: %v", err)
 	}
 	largest, err := getTokenLargestAccountsPump(ctx, c, mint)
-	if ikemeSkipHoldersWhenLargestEmpty() && (err != nil || largest == nil || len(largest.Value) == 0) {
-		log.Printf("[RISK] holders: getTokenLargestAccounts пусто/ошибка (часто на свежем минте) — пропуск проверки: %v", err)
-		return true, ""
+	if err != nil {
+		return false, fmt.Sprintf("holders: getTokenLargestAccounts error: %v", err)
 	}
-	if err != nil || largest == nil || len(largest.Value) == 0 {
-		return false, "holders: getTokenLargestAccounts empty"
+	if largest == nil || len(largest.Value) == 0 {
+		return false, "holders: getTokenLargestAccounts empty after retries"
 	}
 	maxPct := 0.0
 	for _, x := range largest.Value {

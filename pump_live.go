@@ -400,9 +400,27 @@ func swapPumpFun(ctx context.Context, rpcClient *rpc.Client, wallet solana.Priva
 	// Бюджет SOL в инструкции buy_exact_sol_in (первый аргумент) с небольшим запасом под движение кривой.
 	spendableBudget := pumpSpendableWithBuffer(spendableLamports, pumpSpendableBufferBps)
 
+	// После покупки на кошельке должно остаться ≥0.01 SOL под газ и приоритетные сборы (не сливать весь SOL в кривую).
+	const minSolReserveAfterPumpBuyLamports uint64 = 10_000_000
+	estThisTxFees := priorityFeeLamports + 25_000 // приоритет из .env + базовая комиссия/запас
+	minBalanceRequired := spendableBudget + minSolReserveAfterPumpBuyLamports + estThisTxFees
+
 	natBal, err := rpcClient.GetBalance(ctx, owner, rpc.CommitmentProcessed)
-	if err != nil || natBal == nil || natBal.Value < spendableBudget+3_000_000 {
-		return solana.Signature{}, fmt.Errorf("insufficient native SOL for pump buy (need ~%d+ lamports incl. buffer)", spendableBudget)
+	if err != nil {
+		return solana.Signature{}, fmt.Errorf("getBalance: %w", err)
+	}
+	if natBal == nil {
+		return solana.Signature{}, fmt.Errorf("getBalance: empty response")
+	}
+	if natBal.Value < minBalanceRequired {
+		return solana.Signature{}, fmt.Errorf(
+			"insufficient SOL: after buy need ≥%.4f SOL reserve for fees + this tx (~%d lamports priority); have %d lamports, need ≥%d (spendable_budget %d)",
+			float64(minSolReserveAfterPumpBuyLamports)/1e9,
+			priorityFeeLamports,
+			natBal.Value,
+			minBalanceRequired,
+			spendableBudget,
+		)
 	}
 
 	// Самый свежий снимок Bonding Curve сразу перед котировкой и сборкой tx (без «кеша» между RPC-вызовами).
