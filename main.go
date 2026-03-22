@@ -356,6 +356,7 @@ func main() {
 	applyTradingEnvFromEnv()
 	initPumpLiveBuyGuardsFromEnv()
 	logIkemeDelayStartupWarning()
+	logIkemeQualityFiltersStartup()
 	reloadSmartMoneyLeadersFromEnv()
 
 	// Официальные mainnet ID: pump-public-docs и Raydium (CP-Swap). В промпте часто встречаются опечатки — правьте .env.

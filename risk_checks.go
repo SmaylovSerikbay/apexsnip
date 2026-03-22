@@ -65,6 +65,12 @@ func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEM
 func ikemeSkipVelocityWhenDexEmpty() bool { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
 // При наличии Twitter/Telegram в Dex — не требовать min volume/tx (ранний вход до «разгона» объёма).
 func ikemeRelaxVelocityWhenSocialsPresent() bool { return envIkemeBool("PUMP_IKEME_RELAX_VELOCITY_WHEN_SOCIALS", true) }
+// Требовать хотя бы Twitter или Telegram в Dexscreener (меньше «пустых» сливов; меньше сделок).
+func ikemeRequireDexSocials() bool { return envIkemeBool("PUMP_IKEME_REQUIRE_DEX_SOCIALS", false) }
+// Не пропускать монеты с volume=0 и tx=0 в Dex, если нет соцсетей (жёстче, чем SKIP_VELOCITY_WHEN_DEX_EMPTY).
+func ikemeStrictEmptyDexVelocity() bool { return envIkemeBool("PUMP_IKEME_STRICT_EMPTY_DEX", false) }
+// Макс. % уже проданного с кривой на момент входа; выше — считаем «уже накачали» (0 = проверка выкл.).
+func ikemeMaxCurveSoldPct() float64 { return envIkemeFloat("PUMP_IKEME_MAX_CURVE_SOLD_PCT", 0) }
 
 // Пауза перед getTokenLargestAccounts (мс). По умолчанию 0 — ранний вход; при лаге RPC поднять (напр. 500–1000).
 func ikemeHoldersPreDelay() time.Duration {
@@ -162,6 +168,22 @@ func maxVolumeWindow(m5, m15, h1, h6, h24 float64) float64 {
 	return m
 }
 
+// passesPumpBondingCurveMaxSold — отсечь вход, когда кривая уже сильно сдвинута (часто фронтран / скам).
+func passesPumpBondingCurveMaxSold(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
+	maxPct := ikemeMaxCurveSoldPct()
+	if maxPct <= 0 || maxPct >= 100 {
+		return true, ""
+	}
+	pct, err := ComputePumpBondingCurveSoldPct(ctx, c, mint)
+	if err != nil {
+		return false, fmt.Sprintf("max curve sold: %v", err)
+	}
+	if pct > maxPct {
+		return false, fmt.Sprintf("curve уже %.2f%% продано > max %.2f%% (поздно / риск слива)", pct, maxPct)
+	}
+	return true, ""
+}
+
 // dexPairVolumeAndTxActivity — лучшая пара по объёму; сделки = max(m5, h1) (у свежих монет h1 часто 0).
 func dexPairVolumeAndTxActivity(body *dexscreenerTokenPairs, mint string) (volUSD float64, events int, pumpPair bool) {
 	want := strings.ToLower(strings.TrimSpace(mint))
@@ -205,6 +227,9 @@ func passesPumpVelocityAndVolumeAfterDelay(body *dexscreenerTokenPairs, mint str
 	vol, ev, _ := dexPairVolumeAndTxActivity(body, mint)
 	if vol <= 0 && ev <= 0 {
 		log.Printf("[RISK] Skipping: No volume yet")
+	}
+	if ikemeStrictEmptyDexVelocity() && vol <= 0 && ev <= 0 && countTwitterTelegramLinks(body, mint) < 1 {
+		return false, "strict empty dex: нет volume/tx и нет Twitter/Telegram (PUMP_IKEME_STRICT_EMPTY_DEX)"
 	}
 	if ikemeRelaxVelocityWhenSocialsPresent() && countTwitterTelegramLinks(body, mint) >= 1 {
 		log.Printf("[RISK] velocity: есть Twitter/Telegram в Dex — пропуск порогов объёма/tx (не ждём крупный объём)")
@@ -507,6 +532,9 @@ func passesPumpIkemeRisk(ctx context.Context, c *rpc.Client, mint solana.PublicK
 	if ok, why := passesPumpSocialsTelegram(&body, mintStr); !ok {
 		return false, why
 	}
+	if ikemeRequireDexSocials() && countTwitterTelegramLinks(&body, mintStr) < 1 {
+		return false, "ikeme: нужен Twitter или Telegram в Dex (PUMP_IKEME_REQUIRE_DEX_SOCIALS=true)"
+	}
 	if skipRandomDelay {
 		log.Printf("[RISK] Pump %s: ikeme — пропуск PUMP_IKEME_DELAY_* (быстрый режим)", mintStr)
 	} else if ikemeDelayMinSec() == 0 && ikemeDelayMaxSec() == 0 {
@@ -529,6 +557,9 @@ func passesPumpIkemeRisk(ctx context.Context, c *rpc.Client, mint solana.PublicK
 	if ok, why := passesPumpBondingCurveProgress(ctx, c, mint); !ok {
 		return false, why
 	}
+	if ok, why := passesPumpBondingCurveMaxSold(ctx, c, mint); !ok {
+		return false, why
+	}
 	if ok, why := passesPumpTopHolderConcentration(ctx, c, mint); !ok {
 		return false, why
 	}
@@ -545,4 +576,17 @@ func logIkemeDelayStartupWarning() {
 		return
 	}
 	log.Printf("[CONFIG] ВНИМАНИЕ: PUMP_IKEME_DELAY_SEC_MIN=%d MAX=%d — перед повторным Dex пауза до %d с. Для входа в первые секунды выставьте PUMP_IKEME_DELAY_SEC_MIN=0 и PUMP_IKEME_DELAY_SEC_MAX=0", minS, maxS, maxS)
+}
+
+// logIkemeQualityFiltersStartup — подсказка по «анти-слив» фильтрам.
+func logIkemeQualityFiltersStartup() {
+	if !ikemeEnabled() {
+		return
+	}
+	if ikemeRequireDexSocials() || ikemeStrictEmptyDexVelocity() || ikemeMaxCurveSoldPct() > 0 {
+		log.Printf("[CONFIG] Ikeme quality: REQUIRE_DEX_SOCIALS=%v STRICT_EMPTY_DEX=%v MAX_CURVE_SOLD_PCT=%.2f",
+			ikemeRequireDexSocials(), ikemeStrictEmptyDexVelocity(), ikemeMaxCurveSoldPct())
+		return
+	}
+	log.Printf("[CONFIG] Ikeme: режим «много сделок» (слабые фильтры). Меньше сливов: PUMP_IKEME_REQUIRE_DEX_SOCIALS=true, PUMP_IKEME_STRICT_EMPTY_DEX=true, PUMP_IKEME_MAX_CURVE_SOLD_PCT=10-15")
 }
