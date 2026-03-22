@@ -57,7 +57,7 @@ func ikemeDelayMaxSec() int                      { return envIkemeInt("PUMP_IKEM
 func ikemeMinVolumeUSD() float64               { return envIkemeFloat("PUMP_IKEME_MIN_VOLUME_USD", 0) }
 func ikemeMinTxEvents() int                    { return envIkemeInt("PUMP_IKEME_MIN_TX_EVENTS", 0) }
 func ikemeMaxNonCurveHolderPct() float64       { return envIkemeFloat("PUMP_IKEME_MAX_HOLDER_PCT", 30) }
-func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0.5) }
+func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0) }
 func ikemeSkipVelocityWhenDexEmpty() bool      { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
 
 // pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2–5 с).
@@ -174,7 +174,11 @@ func passesPumpVelocityAndVolumeAfterDelay(body *dexscreenerTokenPairs, mint str
 }
 
 // passesPumpBondingCurveProgress — прогресс кривой: (initial_real - real_token) / initial_real >= minPct.
+// PUMP_IKEME_MIN_CURVE_PROGRESS_PCT <= 0 — проверка отключена (ранний вход ~0.2–0.4% иначе режется).
 func passesPumpBondingCurveProgress(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
+	if ikemeMinBondingCurveProgressPct() <= 0 {
+		return true, ""
+	}
 	gp, _, err := derivePumpGlobal()
 	if err != nil {
 		return false, fmt.Sprintf("curve progress: global PDA: %v", err)
