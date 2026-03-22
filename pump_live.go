@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"math/big"
 	"os"
 	"strconv"
@@ -44,7 +45,28 @@ var (
 
 	livePumpLastBuyAt time.Time
 	livePumpBuyGateMu sync.Mutex
+
+	// Анти «памп за 5 с — дамп за 10 с»: чаще опрос цены + в первые минуты более жёсткий SL, чем −35%%.
+	pumpLivePricePollInterval  = 800 * time.Millisecond
+	pumpLiveEarlyStopLossPct   = 12.0 // 0 = выкл.; иначе −N%% от входа в окне (раньше срабатывает, чем −35%%)
+	pumpLiveEarlyStopWindowSec = 120  // 0 = не применять ранний SL
 )
+
+// livePumpEffectiveStopMultiplier — до включения трейлинга: в первые N секунд может быть −12%% вместо −35%%.
+func livePumpEffectiveStopMultiplier(openedAt time.Time) float64 {
+	if pumpLiveEarlyStopLossPct <= 0 || pumpLiveEarlyStopWindowSec <= 0 {
+		return targetStopLossMultiplier
+	}
+	if time.Since(openedAt) >= time.Duration(pumpLiveEarlyStopWindowSec)*time.Second {
+		return targetStopLossMultiplier
+	}
+	earlyMult := 1.0 - pumpLiveEarlyStopLossPct/100.0
+	if earlyMult < 0.05 {
+		earlyMult = 0.05
+	}
+	// Более «жёсткий» стоп = выше цена выхода от нуля → больший множитель (0.88 против 0.65).
+	return math.Max(earlyMult, targetStopLossMultiplier)
+}
 
 // initPumpLiveBuyGuardsFromEnv — PUMP_LIVE_MAX_OPEN_POSITIONS, PUMP_LIVE_MIN_SECONDS_BETWEEN_BUYS.
 func initPumpLiveBuyGuardsFromEnv() {
@@ -58,8 +80,25 @@ func initPumpLiveBuyGuardsFromEnv() {
 			pumpLiveMinBetweenBuys = time.Duration(v) * time.Second
 		}
 	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_LIVE_POLL_INTERVAL_MS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 250 && v <= 30_000 {
+			pumpLivePricePollInterval = time.Duration(v) * time.Millisecond
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_LIVE_EARLY_STOP_LOSS_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0 && v <= 60 {
+			pumpLiveEarlyStopLossPct = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_LIVE_EARLY_STOP_WINDOW_SEC")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 0 && v <= 600 {
+			pumpLiveEarlyStopWindowSec = v
+		}
+	}
 	log.Printf("[PUMP LIVE] защита: max_open=%d (0=без лимита), min_between_buys=%v",
 		pumpLiveMaxOpenPositions, pumpLiveMinBetweenBuys)
+	log.Printf("[PUMP LIVE] выход: poll=%v, ранний SL −%.1f%% первые %ds (0=выкл.), потом −35%%",
+		pumpLivePricePollInterval, pumpLiveEarlyStopLossPct, pumpLiveEarlyStopWindowSec)
 }
 
 func countLivePumpOpenPositions() int {
@@ -687,7 +726,7 @@ func startLivePumpExitTracker(ctx context.Context, rpcClient *rpc.Client, wallet
 				log.Printf("[LIVE PUMP] monitor panic recovered: %v", r)
 			}
 		}()
-		t := time.NewTicker(pricePollInterval)
+		t := time.NewTicker(pumpLivePricePollInterval)
 		defer t.Stop()
 		if done := monitorLivePumpOnce(ctx, rpcClient, wallet, mintStr); done {
 			return
@@ -719,6 +758,7 @@ func monitorLivePumpOnce(ctx context.Context, rpcClient *rpc.Client, wallet sola
 	}
 	entryUSD := pos.EntryUSD
 	rem := pos.RemainingFraction
+	openedAt := pos.OpenedAt
 
 	if err == nil && price > 0 {
 		pos.LastAPIPriceOKAt = time.Now()
@@ -765,9 +805,14 @@ func monitorLivePumpOnce(ctx context.Context, rpcClient *rpc.Client, wallet sola
 	}
 	livePumpMu.Unlock()
 
+	slMult := livePumpEffectiveStopMultiplier(openedAt)
 	if !trailingArmed {
-		if price <= entryUSD*targetStopLossMultiplier {
-			log.Printf("[LIVE PUMP] STOP_LOSS %s", mintStr)
+		if price <= entryUSD*slMult {
+			if slMult > targetStopLossMultiplier+1e-9 {
+				log.Printf("[LIVE PUMP] STOP_LOSS (ранний −%.1f%% в первые %ds) %s", pumpLiveEarlyStopLossPct, pumpLiveEarlyStopWindowSec, mintStr)
+			} else {
+				log.Printf("[LIVE PUMP] STOP_LOSS %s", mintStr)
+			}
 			if _, e := swapPumpFunSellAll(pctx, rpcClient, wallet, mintPK, slippageBps); e != nil {
 				log.Printf("[LIVE PUMP] SL sell failed: %v", e)
 			}
@@ -786,8 +831,12 @@ func monitorLivePumpOnce(ctx context.Context, rpcClient *rpc.Client, wallet sola
 		deleteLivePump(mintStr)
 		return true
 	}
-	if price <= entryUSD*targetStopLossMultiplier {
-		log.Printf("[LIVE PUMP] STOP_LOSS (hard) %s", mintStr)
+	if price <= entryUSD*slMult {
+		if slMult > targetStopLossMultiplier+1e-9 {
+			log.Printf("[LIVE PUMP] STOP_LOSS (ранний −%.1f%%) %s", pumpLiveEarlyStopLossPct, mintStr)
+		} else {
+			log.Printf("[LIVE PUMP] STOP_LOSS (hard) %s", mintStr)
+		}
 		if _, e := swapPumpFunSellAll(pctx, rpcClient, wallet, mintPK, slippageBps); e != nil {
 			log.Printf("[LIVE PUMP] SL sell failed: %v", e)
 		}
