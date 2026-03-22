@@ -58,6 +58,11 @@ func derivePumpBondingCurve(mint solana.PublicKey) (solana.PublicKey, uint8, err
 	return solana.FindProgramAddress([][]byte{[]byte("bonding-curve"), mint.Bytes()}, pumpFunProgram)
 }
 
+// derivePumpBondingCurveV2 — обязательный аккаунт после апгрейда Pump (cashback / v2); последний в buy_exact_sol_in и sell.
+func derivePumpBondingCurveV2(mint solana.PublicKey) (solana.PublicKey, uint8, error) {
+	return solana.FindProgramAddress([][]byte{[]byte("bonding-curve-v2"), mint.Bytes()}, pumpFunProgram)
+}
+
 func derivePumpEventAuthority() (solana.PublicKey, uint8, error) {
 	return solana.FindProgramAddress([][]byte{[]byte("__event_authority")}, pumpFunProgram)
 }
@@ -462,6 +467,10 @@ func swapPumpFun(ctx context.Context, rpcClient *rpc.Client, wallet solana.Priva
 	if err != nil {
 		return solana.Signature{}, err
 	}
+	bondingCurveV2, _, err := derivePumpBondingCurveV2(mint)
+	if err != nil {
+		return solana.Signature{}, err
+	}
 
 	data := encodePumpBuyExactSolInData(spendableBudget, minOut)
 
@@ -482,6 +491,7 @@ func swapPumpFun(ctx context.Context, rpcClient *rpc.Client, wallet solana.Priva
 		{PublicKey: uVol, IsSigner: false, IsWritable: true},
 		{PublicKey: feeCfg, IsSigner: false, IsWritable: false},
 		{PublicKey: pumpFeeProgramPK, IsSigner: false, IsWritable: false},
+		{PublicKey: bondingCurveV2, IsSigner: false, IsWritable: false},
 	}
 
 	buyIx := solana.NewInstruction(pumpFunProgram, metas, data)
@@ -829,6 +839,10 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *rpc.Client, wallet so
 	if err != nil {
 		return solana.Signature{}, err
 	}
+	bondingCurveV2, _, err := derivePumpBondingCurveV2(mint)
+	if err != nil {
+		return solana.Signature{}, err
+	}
 
 	data := encodePumpSellData(tokenAmount, minSol)
 
@@ -847,6 +861,7 @@ func swapPumpFunSellAmount(ctx context.Context, rpcClient *rpc.Client, wallet so
 		{PublicKey: pumpFunProgram, IsSigner: false, IsWritable: false},
 		{PublicKey: feeCfg, IsSigner: false, IsWritable: false},
 		{PublicKey: pumpFeeProgramPK, IsSigner: false, IsWritable: false},
+		{PublicKey: bondingCurveV2, IsSigner: false, IsWritable: false},
 	}
 
 	sellIx := solana.NewInstruction(pumpFunProgram, metas, data)
