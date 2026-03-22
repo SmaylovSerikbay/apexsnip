@@ -35,9 +35,70 @@ var pumpSellDisc = []byte{51, 230, 133, 164, 1, 127, 131, 173}
 
 // livePumpMu + livePumpOpenPositions — боевые позиции Pump (параллельно SIM).
 var (
-	livePumpMu          sync.Mutex
+	livePumpMu            sync.Mutex
 	livePumpOpenPositions = make(map[string]*livePumpPosition)
+
+	// Анти-слив: лимит одновременных live BUY и минимальный интервал между ними (мелкий кошелёк / два create подряд).
+	pumpLiveMaxOpenPositions int           = 1   // 0 = без лимита
+	pumpLiveMinBetweenBuys   time.Duration = 90 * time.Second // 0 = выкл
+
+	livePumpLastBuyAt time.Time
+	livePumpBuyGateMu sync.Mutex
 )
+
+// initPumpLiveBuyGuardsFromEnv — PUMP_LIVE_MAX_OPEN_POSITIONS, PUMP_LIVE_MIN_SECONDS_BETWEEN_BUYS.
+func initPumpLiveBuyGuardsFromEnv() {
+	if s := strings.TrimSpace(os.Getenv("PUMP_LIVE_MAX_OPEN_POSITIONS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 0 {
+			pumpLiveMaxOpenPositions = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_LIVE_MIN_SECONDS_BETWEEN_BUYS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 0 {
+			pumpLiveMinBetweenBuys = time.Duration(v) * time.Second
+		}
+	}
+	log.Printf("[PUMP LIVE] защита: max_open=%d (0=без лимита), min_between_buys=%v",
+		pumpLiveMaxOpenPositions, pumpLiveMinBetweenBuys)
+}
+
+func countLivePumpOpenPositions() int {
+	livePumpMu.Lock()
+	defer livePumpMu.Unlock()
+	n := 0
+	for _, p := range livePumpOpenPositions {
+		if p != nil && p.RemainingFraction > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// pumpLiveGuardAllowsNewBuy — перед live swapPumpFun: не открывать N позиций подряд и не чаще чем раз в N секунд.
+func pumpLiveGuardAllowsNewBuy() (ok bool, reason string) {
+	if pumpLiveMaxOpenPositions > 0 {
+		n := countLivePumpOpenPositions()
+		if n >= pumpLiveMaxOpenPositions {
+			return false, fmt.Sprintf("уже %d/%d открытых live pump (PUMP_LIVE_MAX_OPEN_POSITIONS)", n, pumpLiveMaxOpenPositions)
+		}
+	}
+	livePumpBuyGateMu.Lock()
+	defer livePumpBuyGateMu.Unlock()
+	if pumpLiveMinBetweenBuys > 0 && !livePumpLastBuyAt.IsZero() {
+		elapsed := time.Since(livePumpLastBuyAt)
+		if elapsed < pumpLiveMinBetweenBuys {
+			wait := pumpLiveMinBetweenBuys - elapsed
+			return false, fmt.Sprintf("кулдаун между BUY: ждите ещё ~%v (PUMP_LIVE_MIN_SECONDS_BETWEEN_BUYS)", wait.Round(time.Second))
+		}
+	}
+	return true, ""
+}
+
+func recordLivePumpBuyCommitted() {
+	livePumpBuyGateMu.Lock()
+	livePumpLastBuyAt = time.Now()
+	livePumpBuyGateMu.Unlock()
+}
 
 // livePumpPosition — зеркало simPosition для live Pump.fun (USD-цена с Jupiter/Dex).
 type livePumpPosition struct {

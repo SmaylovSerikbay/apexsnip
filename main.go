@@ -354,6 +354,7 @@ func main() {
 
 	rpcClient := rpc.New(rpcURL)
 	applyTradingEnvFromEnv()
+	initPumpLiveBuyGuardsFromEnv()
 	logIkemeDelayStartupWarning()
 	reloadSmartMoneyLeadersFromEnv()
 
@@ -1417,6 +1418,12 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 		startExitTracker(mint.String())
 		return
 	}
+	if ok, why := pumpLiveGuardAllowsNewBuy(); !ok {
+		logPumpCheckingLine(ctx, rpcClient, mint, false)
+		logPumpScanResult(mint.String(), sigStr, false, "live-guard: "+why)
+		logRejected(mint.String(), fmt.Sprintf("[PUMP] %s", why))
+		return
+	}
 	buySig, err := swapPumpFun(ctx, rpcClient, wallet, mint, BUY_LAMPORTS)
 	if err != nil {
 		logPumpCheckingLine(ctx, rpcClient, mint, true)
@@ -1424,6 +1431,7 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 		log.Printf("[PUMP] live buy failed mint=%s: %v", mint.String(), err)
 		return
 	}
+	recordLivePumpBuyCommitted()
 	logPumpCheckingLine(ctx, rpcClient, mint, true)
 	logPumpScanResult(mint.String(), sigStr, true, "live buy submitted")
 	log.Printf("[PUMP] live BUY submitted | tx=%s | %s", buySig.String(), solscanTxURL(buySig.String()))
@@ -1523,12 +1531,18 @@ func handleSmartMoneyFollowNotification(ctx context.Context, rpcClient *rpc.Clie
 		return
 	}
 
+	if ok, why := pumpLiveGuardAllowsNewBuy(); !ok {
+		logPumpScanResult(mint.String(), sigStr, false, "smart-follow live-guard: "+why)
+		logRejected(mint.String(), fmt.Sprintf("[SMART] %s", why))
+		return
+	}
 	buySig, err := swapPumpFun(ctx, rpcClient, wallet, mint, BUY_LAMPORTS)
 	if err != nil {
 		logPumpScanResult(mint.String(), sigStr, false, fmt.Sprintf("smart-follow swapPumpFun: %v", err))
 		log.Printf("[SMART] live buy failed mint=%s: %v", mint.String(), err)
 		return
 	}
+	recordLivePumpBuyCommitted()
 	logPumpScanResult(mint.String(), sigStr, true, "smart-follow live buy OK")
 	log.Printf("[SMART] live BUY | tx=%s | %s", buySig.String(), solscanTxURL(buySig.String()))
 	fmt.Printf("🟢 [SMART] Live BUY (follow) | Solscan: %s\n", solscanTxURL(buySig.String()))
