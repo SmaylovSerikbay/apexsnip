@@ -566,6 +566,32 @@ func swapPumpFun(ctx context.Context, rpcClient *rpc.Client, wallet solana.Priva
 }
 
 // registerLivePumpBuy — после успешной покупки: цена входа в USD и мониторинг.
+// livePumpHasOpenPosition — уже есть открытая live-позиция по этому mint (анти-дубль create + smart-follow).
+func livePumpHasOpenPosition(mint string) bool {
+	livePumpMu.Lock()
+	defer livePumpMu.Unlock()
+	p, ok := livePumpOpenPositions[mint]
+	return ok && p != nil && p.RemainingFraction > 0
+}
+
+// pumpBondingCurveCreator — creator из аккаунта bonding curve (для risk-check при follow, не из create-tx).
+func pumpBondingCurveCreator(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (solana.PublicKey, error) {
+	bondingCurve, _, err := derivePumpBondingCurve(mint)
+	if err != nil {
+		return solana.PublicKey{}, err
+	}
+	bcInfo, err := c.GetAccountInfoWithOpts(ctx, bondingCurve, &rpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: rpc.CommitmentProcessed})
+	if err != nil || bcInfo == nil || bcInfo.Value == nil || bcInfo.Value.Data == nil {
+		return solana.PublicKey{}, fmt.Errorf("bonding curve account missing")
+	}
+	bcData := bcInfo.Value.Data.GetBinary()
+	_, _, _, _, _, _, creator, err := parsePumpBondingCurveData(bcData)
+	if err != nil {
+		return solana.PublicKey{}, err
+	}
+	return creator, nil
+}
+
 func registerLivePumpBuy(mint string, entryUSD float64) {
 	livePumpMu.Lock()
 	defer livePumpMu.Unlock()

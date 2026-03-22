@@ -2,6 +2,7 @@
 //
 // Raydium AMM V4: Initialize2 → rug-check → симуляция / swap_base_in + Jupiter TP/SL.
 // Pump.fun: Anchor create → mint из инструкции → симуляция BUY (без Raydium V4 пула).
+// Follow the Smart Money: при buy_exact_sol_in от кошелька из PUMP_SMART_MONEY_WALLETS — вход с задержкой (см. smart_money.go).
 // Raydium CPMM (CP-Swap): Anchor initialize → выбор mint → симуляция BUY.
 //
 // Запуск: go run -mod=vendor .   или   go build -mod=vendor -o sniper.exe .
@@ -76,6 +77,12 @@ const (
 )
 
 const pumpCreateUserAccountIndex = 7 // accounts[7] = user (signer)
+
+// buy_exact_sol_in (IDL): mint @2, signer (user) @6 — см. swapPumpFun metas в pump_live.go.
+const (
+	pumpBuyMintAccountIndex = 2
+	pumpBuyUserAccountIndex = 6
+)
 
 // pumpMinCreatorLamports — минимум SOL на кошельке создателя Pump create; по умолчанию 0.01 SOL (часто <0.02 после комиссий).
 // Переопределение: PUMP_MIN_CREATOR_LAMPORTS в .env (лампорты).
@@ -347,6 +354,8 @@ func main() {
 
 	rpcClient := rpc.New(rpcURL)
 	applyTradingEnvFromEnv()
+	logIkemeDelayStartupWarning()
+	reloadSmartMoneyLeadersFromEnv()
 
 	// Официальные mainnet ID: pump-public-docs и Raydium (CP-Swap). В промпте часто встречаются опечатки — правьте .env.
 	pumpFunProgram = publicKeyFromEnvOrDefault("PUMP_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
@@ -558,16 +567,31 @@ func onPumpLogMessage(ctx context.Context, rpcClient *rpc.Client, wallet solana.
 		return
 	}
 	wsNotifOK.Add(1)
-	if !logsAnchorInstructionForProgram(msg.Value.Logs, pumpFunProgram, "create") {
-		return
-	}
-	wsPassedPump.Add(1)
-
+	logs := msg.Value.Logs
 	sig := msg.Value.Signature
-	if _, loaded := seenSignatures.LoadOrStore(sig.String(), true); loaded {
-		return
+
+	if logsAnchorInstructionForProgram(logs, pumpFunProgram, "create") {
+		wsPassedPump.Add(1)
+		if _, loaded := seenSignatures.LoadOrStore(sig.String(), true); !loaded {
+			goHandlerRecover("pump_create", func() { handlePumpCreateNotification(ctx, rpcClient, wallet, sig) })
+		}
 	}
-	goHandlerRecover("pump_create", func() { handlePumpCreateNotification(ctx, rpcClient, wallet, sig) })
+
+	// Follow the Smart Money: Anchor логирует Instruction: BuyExactSolIn → в lower case «buyexactsolin».
+	if smartMoneyFollowActive() && logsPumpProgramBuyExactSolIn(logs) {
+		key := "smf:" + sig.String()
+		if _, loaded := seenSignatures.LoadOrStore(key, true); !loaded {
+			goHandlerRecover("pump_smart_follow", func() { scheduleSmartMoneyFollow(ctx, rpcClient, wallet, sig) })
+		}
+	}
+}
+
+// logsPumpProgramBuyExactSolIn — покупка на кривой (IDL buy_exact_sol_in).
+func logsPumpProgramBuyExactSolIn(logs []string) bool {
+	if logsAnchorInstructionForProgram(logs, pumpFunProgram, "buyexactsolin") {
+		return true
+	}
+	return logsAnchorInstructionForProgram(logs, pumpFunProgram, "buy_exact_sol_in")
 }
 
 func onCPMMLogMessage(ctx context.Context, rpcClient *rpc.Client, wallet solana.PrivateKey, msg *ws.LogResult) {
@@ -1369,7 +1393,7 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 		logRejected(mint.String(), fmt.Sprintf("[PUMP] risk-check: %s", why))
 		return
 	}
-	if ok, why := passesPumpIkemeRisk(ctx, rpcClient, mint); !ok {
+	if ok, why := passesPumpIkemeRisk(ctx, rpcClient, mint, false); !ok {
 		logPumpCheckingLine(ctx, rpcClient, mint, false)
 		logPumpScanResult(mint.String(), sigStr, false, "ikeme-risk: "+why)
 		logRejected(mint.String(), fmt.Sprintf("[PUMP] ikeme-risk: %s", why))
@@ -1407,6 +1431,112 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 	entry, err := fetchTokenPriceUSDFromAPIs(ctx, mint.String())
 	if err != nil {
 		log.Printf("[PUMP] entry price fetch after buy: %v", err)
+		entry = 0
+	}
+	registerLivePumpBuy(mint.String(), entry)
+	startLivePumpExitTracker(ctx, rpcClient, wallet, mint.String())
+	notifyNewTokenFoundWhatsApp(mint.String())
+}
+
+// scheduleSmartMoneyFollow — задержка после транзакции лидера (дефолт 500 ms), затем разбор и BUY.
+func scheduleSmartMoneyFollow(ctx context.Context, rpcClient *rpc.Client, wallet solana.PrivateKey, sig solana.Signature) {
+	t := time.NewTimer(smartMoneyFollowDelay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-t.C:
+	}
+	handleSmartMoneyFollowNotification(ctx, rpcClient, wallet, sig)
+}
+
+// handleSmartMoneyFollowNotification — «хвост» за кошельком из PUMP_SMART_MONEY_WALLETS после его buy_exact_sol_in.
+func handleSmartMoneyFollowNotification(ctx context.Context, rpcClient *rpc.Client, wallet solana.PrivateKey, sig solana.Signature) {
+	sigStr := sig.String()
+	out, err := getTransactionConfirmedRetry(ctx, rpcClient, sig)
+	if err != nil {
+		log.Printf("[SMART] getTransaction sig=%s: %v", sigStr, err)
+		return
+	}
+	if out.Meta == nil || out.Meta.Err != nil {
+		return
+	}
+	tx, err := out.Transaction.GetTransaction()
+	if err != nil {
+		log.Printf("[SMART] decode tx sig=%s: %v", sigStr, err)
+		return
+	}
+	keys := fullAccountKeys(tx.Message.AccountKeys, out.Meta)
+	mint, leader, ok := findPumpBuyExactSolInMintAndUserInTransaction(tx, out.Meta, keys)
+	if !ok {
+		return
+	}
+	if !isSmartMoneyLeader(leader) {
+		return
+	}
+	if leader.Equals(wallet.PublicKey()) {
+		return
+	}
+
+	if !IS_SIMULATION && livePumpHasOpenPosition(mint.String()) {
+		log.Printf("[SMART] skip follow: уже есть live-позиция mint=%s", mint.String())
+		return
+	}
+
+	pumpDev, err := pumpBondingCurveCreator(ctx, rpcClient, mint)
+	if err != nil {
+		logPumpScanResult(mint.String(), sigStr, false, "smart-follow: bonding curve creator: "+err.Error())
+		logRejected(mint.String(), fmt.Sprintf("[SMART] creator: %v", err))
+		return
+	}
+
+	if ok, why := passesMintSecurity(ctx, rpcClient, mint, pumpDev, pumpMinCreatorLamports); !ok {
+		logPumpCheckingLine(ctx, rpcClient, mint, false)
+		logPumpScanResult(mint.String(), sigStr, false, "smart-follow risk: "+why)
+		logRejected(mint.String(), fmt.Sprintf("[SMART] risk: %s", why))
+		return
+	}
+	if ok, why := passesPumpIkemeRisk(ctx, rpcClient, mint, smartMoneySkipIkemeRandomDelay()); !ok {
+		logPumpCheckingLine(ctx, rpcClient, mint, false)
+		logPumpScanResult(mint.String(), sigStr, false, "smart-follow ikeme: "+why)
+		logRejected(mint.String(), fmt.Sprintf("[SMART] ikeme: %s", why))
+		return
+	}
+
+	log.Printf("[SMART] follow BUY | leader=%s mint=%s after=%s leader_sig=%s",
+		leader.String(), mint.String(), smartMoneyFollowDelay, solscanTxURL(sigStr))
+
+	if IS_SIMULATION {
+		entry, err := fetchTokenPriceUSDFromAPIs(ctx, mint.String())
+		if err != nil {
+			logPumpScanResult(mint.String(), sigStr, false, fmt.Sprintf("smart-follow price API: %v", err))
+			return
+		}
+		if !reportSimulationBuy(mint.String(), entry) {
+			logPumpScanResult(mint.String(), sigStr, false, "smart-follow sim: не открыта позиция")
+			return
+		}
+		logPumpScanResult(mint.String(), sigStr, true, "smart-follow simulation OK")
+		appendSnipeLog(fmt.Sprintf("%s | SMART_FOLLOW_SIM | leader=%s | mint=%s | leader_sig=%s",
+			time.Now().UTC().Format(time.RFC3339Nano), leader.String(), mint.String(), sigStr))
+		startExitTracker(mint.String())
+		return
+	}
+
+	buySig, err := swapPumpFun(ctx, rpcClient, wallet, mint, BUY_LAMPORTS)
+	if err != nil {
+		logPumpScanResult(mint.String(), sigStr, false, fmt.Sprintf("smart-follow swapPumpFun: %v", err))
+		log.Printf("[SMART] live buy failed mint=%s: %v", mint.String(), err)
+		return
+	}
+	logPumpScanResult(mint.String(), sigStr, true, "smart-follow live buy OK")
+	log.Printf("[SMART] live BUY | tx=%s | %s", buySig.String(), solscanTxURL(buySig.String()))
+	fmt.Printf("🟢 [SMART] Live BUY (follow) | Solscan: %s\n", solscanTxURL(buySig.String()))
+	appendSnipeLog(fmt.Sprintf("%s | SMART_FOLLOW | leader=%s | mint=%s | leader_sig=%s | our_tx=%s",
+		time.Now().UTC().Format(time.RFC3339Nano), leader.String(), mint.String(), sigStr, buySig.String()))
+	entry, err := fetchTokenPriceUSDFromAPIs(ctx, mint.String())
+	if err != nil {
+		log.Printf("[SMART] entry price after buy: %v", err)
 		entry = 0
 	}
 	registerLivePumpBuy(mint.String(), entry)
@@ -1576,6 +1706,43 @@ func findPumpCreateMintAndUserInTransaction(tx *solana.Transaction, meta *rpc.Tr
 		}
 		mi := accounts[0]
 		ui := accounts[pumpCreateUserAccountIndex]
+		if int(mi) >= len(keys) || int(ui) >= len(keys) {
+			return solana.PublicKey{}, solana.PublicKey{}, false
+		}
+		return keys[mi], keys[ui], true
+	}
+	for _, ci := range tx.Message.Instructions {
+		if m, u, o := inspect(ci.ProgramIDIndex, ci.Accounts, []byte(ci.Data)); o {
+			return m, u, true
+		}
+	}
+	for _, block := range meta.InnerInstructions {
+		for _, ci := range block.Instructions {
+			if m, u, o := inspect(ci.ProgramIDIndex, ci.Accounts, []byte(ci.Data)); o {
+				return m, u, true
+			}
+		}
+	}
+	return solana.PublicKey{}, solana.PublicKey{}, false
+}
+
+// findPumpBuyExactSolInMintAndUserInTransaction — buy_exact_sol_in: mint и покупатель (signer).
+func findPumpBuyExactSolInMintAndUserInTransaction(tx *solana.Transaction, meta *rpc.TransactionMeta, keys solana.PublicKeySlice) (mint solana.PublicKey, buyer solana.PublicKey, ok bool) {
+	if meta == nil {
+		return solana.PublicKey{}, solana.PublicKey{}, false
+	}
+	inspect := func(programIDIndex uint16, accounts []uint16, data []byte) (solana.PublicKey, solana.PublicKey, bool) {
+		if int(programIDIndex) >= len(keys) || !keys[programIDIndex].Equals(pumpFunProgram) {
+			return solana.PublicKey{}, solana.PublicKey{}, false
+		}
+		if len(data) < 8 || !bytes.Equal(data[:8], pumpBuyExactSolInDisc) {
+			return solana.PublicKey{}, solana.PublicKey{}, false
+		}
+		if len(accounts) <= pumpBuyUserAccountIndex {
+			return solana.PublicKey{}, solana.PublicKey{}, false
+		}
+		mi := accounts[pumpBuyMintAccountIndex]
+		ui := accounts[pumpBuyUserAccountIndex]
 		if int(mi) >= len(keys) || int(ui) >= len(keys) {
 			return solana.PublicKey{}, solana.PublicKey{}, false
 		}

@@ -494,7 +494,8 @@ func passesPumpTopHolderConcentration(ctx context.Context, c *rpc.Client, mint s
 
 // passesPumpIkemeRisk — полный пайплайн после базового mint-security: соцсети → задержка → объём → кривая → холдеры.
 // Отключить все проверки ikeme: PUMP_IKEME_ENABLED=false
-func passesPumpIkemeRisk(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
+// skipRandomDelay: не вызывать pumpRiskRandomDelay (для smart-follow «на хвосте»; у create оставлять false).
+func passesPumpIkemeRisk(ctx context.Context, c *rpc.Client, mint solana.PublicKey, skipRandomDelay bool) (bool, string) {
 	if !ikemeEnabled() {
 		return true, ""
 	}
@@ -506,14 +507,18 @@ func passesPumpIkemeRisk(ctx context.Context, c *rpc.Client, mint solana.PublicK
 	if ok, why := passesPumpSocialsTelegram(&body, mintStr); !ok {
 		return false, why
 	}
-	if ikemeDelayMinSec() == 0 && ikemeDelayMaxSec() == 0 {
+	if skipRandomDelay {
+		log.Printf("[RISK] Pump %s: ikeme — пропуск PUMP_IKEME_DELAY_* (быстрый режим)", mintStr)
+	} else if ikemeDelayMinSec() == 0 && ikemeDelayMaxSec() == 0 {
 		log.Printf("[RISK] Pump %s: socials OK — без паузы перед volume/curve (ранний вход)", mintStr)
 	} else if ikemeDelayMinSec() == ikemeDelayMaxSec() {
 		log.Printf("[RISK] Pump %s: socials OK, waiting %d s before volume/curve checks…", mintStr, ikemeDelayMinSec())
 	} else {
 		log.Printf("[RISK] Pump %s: socials OK, waiting %d–%d s before volume/curve checks…", mintStr, ikemeDelayMinSec(), ikemeDelayMaxSec())
 	}
-	pumpRiskRandomDelay()
+	if !skipRandomDelay {
+		pumpRiskRandomDelay()
+	}
 	body2, err := fetchDexscreenerTokenPairs(ctx, mintStr)
 	if err != nil {
 		return false, "ikeme: dex refetch: " + err.Error()
@@ -528,4 +533,16 @@ func passesPumpIkemeRisk(ctx context.Context, c *rpc.Client, mint solana.PublicK
 		return false, why
 	}
 	return true, ""
+}
+
+// logIkemeDelayStartupWarning — если в .env задана большая пауза PUMP_IKEME_DELAY_* — поздний вход (минуты).
+func logIkemeDelayStartupWarning() {
+	if !ikemeEnabled() {
+		return
+	}
+	minS, maxS := ikemeDelayMinSec(), ikemeDelayMaxSec()
+	if maxS < 60 {
+		return
+	}
+	log.Printf("[CONFIG] ВНИМАНИЕ: PUMP_IKEME_DELAY_SEC_MIN=%d MAX=%d — перед повторным Dex пауза до %d с. Для входа в первые секунды выставьте PUMP_IKEME_DELAY_SEC_MIN=0 и PUMP_IKEME_DELAY_SEC_MAX=0", minS, maxS, maxS)
 }
