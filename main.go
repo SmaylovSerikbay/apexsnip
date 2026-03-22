@@ -1351,7 +1351,7 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 		startExitTracker(mint.String())
 		return
 	}
-	buySig, err := swapPumpFun(ctx, rpcClient, wallet, mint, BUY_LAMPORTS, pumpDev)
+	buySig, err := swapPumpFun(ctx, rpcClient, wallet, mint, BUY_LAMPORTS)
 	if err != nil {
 		logPumpScanResult(mint.String(), sigStr, false, fmt.Sprintf("live swapPumpFun: %v", err))
 		log.Printf("[PUMP] live buy failed mint=%s: %v", mint.String(), err)
