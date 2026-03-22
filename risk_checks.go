@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -14,30 +15,72 @@ import (
 	"github.com/gagliardetto/solana-go/rpc"
 )
 
-// Настраиваемые пороги (при необходимости вынести в .env позже).
-const (
-	pumpRiskDelaySecsMin = 5
-	pumpRiskDelaySecsMax = 10
+// Пороги по умолчанию смягчены: свежие монеты часто без h1 в Dexscreener — смотрим m5/m15 и max(tx m5, tx h1).
+// Переопределение через .env (см. комментарии в конце файла / .env.example).
 
-	pumpMinVolumeUSD = 300.0
-	// Dexscreener не отдаёт «уникальных трейдеров»; используем сумму сделок h1 как прокси активности.
-	pumpMinTraderEventsH1 = 10
+func envIkemeBool(key string, def bool) bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if s == "" {
+		return def
+	}
+	return s != "0" && s != "false" && s != "no" && s != "off"
+}
 
-	pumpMaxNonCurveHolderPct = 10.0
+func envIkemeFloat(key string, def float64) float64 {
+	s := strings.TrimSpace(os.Getenv(key))
+	if s == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return def
+	}
+	return v
+}
 
-	// Доля токенов, уже проданных с кривой: (initial_real - real) / initial_real (в %).
-	pumpMinBondingCurveProgressPct = 4.0
-)
+func envIkemeInt(key string, def int) int {
+	s := strings.TrimSpace(os.Getenv(key))
+	if s == "" {
+		return def
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return v
+}
 
-// pumpRiskRandomDelay — 5–10 с перед повторной проверкой объёма (не снайпим в первую миллисекунду).
+func ikemeEnabled() bool                         { return envIkemeBool("PUMP_IKEME_ENABLED", true) }
+func ikemeRequireTelegram() bool                 { return envIkemeBool("PUMP_IKEME_REQUIRE_TELEGRAM", false) }
+func ikemeDelayMinSec() int                      { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MIN", 2) }
+func ikemeDelayMaxSec() int                      { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MAX", 5) }
+func ikemeMinVolumeUSD() float64                 { return envIkemeFloat("PUMP_IKEME_MIN_VOLUME_USD", 50) }
+func ikemeMinTxEvents() int                      { return envIkemeInt("PUMP_IKEME_MIN_TX_EVENTS", 3) }
+func ikemeMaxNonCurveHolderPct() float64         { return envIkemeFloat("PUMP_IKEME_MAX_HOLDER_PCT", 30) }
+func ikemeMinBondingCurveProgressPct() float64   { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0.5) }
+
+// pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2–5 с).
 func pumpRiskRandomDelay() {
-	n := pumpRiskDelaySecsMin + rand.Intn(pumpRiskDelaySecsMax-pumpRiskDelaySecsMin+1)
+	minS, maxS := ikemeDelayMinSec(), ikemeDelayMaxSec()
+	if minS < 0 {
+		minS = 0
+	}
+	if maxS < minS {
+		maxS = minS
+	}
+	n := minS
+	if maxS > minS {
+		n += rand.Intn(maxS - minS + 1)
+	}
 	time.Sleep(time.Duration(n) * time.Second)
 }
 
-// passesPumpSocialsTwitterTelegram — оба поля twitter и telegram должны быть заполнены в Dexscreener (как зеркало метаданных).
-func passesPumpSocialsTwitterTelegram(body *dexscreenerTokenPairs, mint string) (bool, string) {
-	hasTwitter, hasTG := false, false
+// passesPumpSocialsTelegram — опционально: Telegram в Dexscreener (PUMP_IKEME_REQUIRE_TELEGRAM=false — пропуск без TG).
+func passesPumpSocialsTelegram(body *dexscreenerTokenPairs, mint string) (bool, string) {
+	if !ikemeRequireTelegram() {
+		return true, ""
+	}
+	hasTG := false
 	want := strings.ToLower(strings.TrimSpace(mint))
 	for _, p := range body.Pairs {
 		matches := strings.ToLower(strings.TrimSpace(p.BaseToken.Address)) == want ||
@@ -51,16 +94,14 @@ func passesPumpSocialsTwitterTelegram(body *dexscreenerTokenPairs, mint string) 
 			if u == "" {
 				continue
 			}
-			if typ == "twitter" || typ == "x" {
-				hasTwitter = true
-			}
 			if typ == "telegram" {
 				hasTG = true
+				break
 			}
 		}
-	}
-	if !hasTwitter {
-		return false, "socials: missing non-empty twitter (Dexscreener info.socials)"
+		if hasTG {
+			break
+		}
 	}
 	if !hasTG {
 		return false, "socials: missing non-empty telegram (Dexscreener info.socials)"
@@ -78,10 +119,10 @@ func maxVolumeWindow(m5, m15, h1, h6, h24 float64) float64 {
 	return m
 }
 
-// h1TraderEvents — лучшая пара по объёму; сумма покупок и продаж за 1ч (прокси активности; уникальные кошельки в Dex API нет).
-func h1TraderEvents(body *dexscreenerTokenPairs, mint string) (volUSD float64, events int, pumpPair bool) {
+// dexPairVolumeAndTxActivity — лучшая пара по объёму; сделки = max(m5, h1) (у свежих монет h1 часто 0).
+func dexPairVolumeAndTxActivity(body *dexscreenerTokenPairs, mint string) (volUSD float64, events int, pumpPair bool) {
 	want := strings.ToLower(strings.TrimSpace(mint))
-	bestVol := 0.0
+	bestVol := -1.0
 	bestEv := 0
 	isPump := false
 	for i := range body.Pairs {
@@ -95,23 +136,33 @@ func h1TraderEvents(body *dexscreenerTokenPairs, mint string) (volUSD float64, e
 			isPump = true
 		}
 		v := maxVolumeWindow(pair.Volume.M5, pair.Volume.M15, pair.Volume.H1, pair.Volume.H6, pair.Volume.H24)
-		ev := pair.Txns.H1.Buys + pair.Txns.H1.Sells
+		m5ev := pair.Txns.M5.Buys + pair.Txns.M5.Sells
+		h1ev := pair.Txns.H1.Buys + pair.Txns.H1.Sells
+		ev := m5ev
+		if h1ev > ev {
+			ev = h1ev
+		}
 		if v > bestVol {
 			bestVol = v
 			bestEv = ev
 		}
+	}
+	if bestVol < 0 {
+		return 0, 0, false
 	}
 	return bestVol, bestEv, isPump
 }
 
 // passesPumpVelocityAndVolumeAfterDelay — вызывать после pumpRiskRandomDelay и свежего fetchDexscreenerTokenPairs.
 func passesPumpVelocityAndVolumeAfterDelay(body *dexscreenerTokenPairs, mint string) (bool, string) {
-	vol, ev, _ := h1TraderEvents(body, mint)
-	if vol < pumpMinVolumeUSD {
-		return false, fmt.Sprintf("velocity: volume_usd_max_window=%.2f < %.0f", vol, pumpMinVolumeUSD)
+	minVol := ikemeMinVolumeUSD()
+	minEv := ikemeMinTxEvents()
+	vol, ev, _ := dexPairVolumeAndTxActivity(body, mint)
+	if vol < minVol {
+		return false, fmt.Sprintf("velocity: volume_usd_max_window=%.2f < %.0f", vol, minVol)
 	}
-	if ev < pumpMinTraderEventsH1 {
-		return false, fmt.Sprintf("velocity: h1_tx_events=%d < %d (proxy for on-chain activity)", ev, pumpMinTraderEventsH1)
+	if ev < minEv {
+		return false, fmt.Sprintf("velocity: tx_events_max(m5,h1)=%d < %d", ev, minEv)
 	}
 	return true, ""
 }
@@ -148,8 +199,9 @@ func passesPumpBondingCurveProgress(ctx context.Context, c *rpc.Client, mint sol
 	}
 	sold := initialReal - realTok
 	pct := float64(sold) / float64(initialReal) * 100
-	if pct < pumpMinBondingCurveProgressPct {
-		return false, fmt.Sprintf("curve progress: %.2f%% < %.1f%% (sold/initial_real)", pct, pumpMinBondingCurveProgressPct)
+	minPct := ikemeMinBondingCurveProgressPct()
+	if pct < minPct {
+		return false, fmt.Sprintf("curve progress: %.2f%% < %.2f%% (sold/initial_real)", pct, minPct)
 	}
 	return true, ""
 }
@@ -200,23 +252,28 @@ func passesPumpTopHolderConcentration(ctx context.Context, c *rpc.Client, mint s
 			maxPct = pct
 		}
 	}
-	if maxPct > pumpMaxNonCurveHolderPct+1e-9 {
-		return false, fmt.Sprintf("holders: largest non-curve wallet %.2f%% > %.0f%% supply", maxPct, pumpMaxNonCurveHolderPct)
+	maxH := ikemeMaxNonCurveHolderPct()
+	if maxPct > maxH+1e-9 {
+		return false, fmt.Sprintf("holders: largest non-curve wallet %.2f%% > %.0f%% supply", maxPct, maxH)
 	}
 	return true, ""
 }
 
 // passesPumpIkemeRisk — полный пайплайн после базового mint-security: соцсети → задержка → объём → кривая → холдеры.
+// Отключить все проверки ikeme: PUMP_IKEME_ENABLED=false
 func passesPumpIkemeRisk(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
+	if !ikemeEnabled() {
+		return true, ""
+	}
 	mintStr := mint.String()
 	body, err := fetchDexscreenerTokenPairs(ctx, mintStr)
 	if err != nil {
 		return false, "ikeme: dex fetch: " + err.Error()
 	}
-	if ok, why := passesPumpSocialsTwitterTelegram(&body, mintStr); !ok {
+	if ok, why := passesPumpSocialsTelegram(&body, mintStr); !ok {
 		return false, why
 	}
-	log.Printf("[RISK] Pump %s: socials OK, waiting %d–%d s before volume/curve checks…", mintStr, pumpRiskDelaySecsMin, pumpRiskDelaySecsMax)
+	log.Printf("[RISK] Pump %s: socials OK, waiting %d–%d s before volume/curve checks…", mintStr, ikemeDelayMinSec(), ikemeDelayMaxSec())
 	pumpRiskRandomDelay()
 	body2, err := fetchDexscreenerTokenPairs(ctx, mintStr)
 	if err != nil {
