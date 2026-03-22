@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -163,10 +165,10 @@ func pumpQuoteExpectedTokensBuyExactSolIn(spendableSolIn, vSol, vToken, protocol
 }
 
 const (
-	// pumpMinOutExtraHaircutBps — доп. снижение min_out (5–10%), поверх slippage + pfee-cushion; снижает риск 6024 при сдвиге кривой.
-	pumpMinOutExtraHaircutBps uint64 = 750 // 7.5%
-	// pumpSpendableBufferBps — запас к первому аргументу buy_exact_sol_in (spendable_sol_in): чуть больший бюджет SOL на сделку.
-	pumpSpendableBufferBps uint64 = 200 // +2%
+	// pumpMinOutExtraHaircutBps — доп. снижение min_out, если не используется PUMP_MIN_OUT_ONE.
+	pumpMinOutExtraHaircutBps uint64 = 2000 // 20%
+	// pumpSpendableBufferBps — 0: не увеличивать spendable (иначе котировка и min_out завышаются и чаще 6024 Overflow).
+	pumpSpendableBufferBps uint64 = 0
 )
 
 // pumpSpendableWithBuffer — spendable_sol_in с небольшим запасом (ceil через big.Int).
@@ -203,6 +205,16 @@ func pumpExtraHaircutMinOut(minOut uint64, extraBps uint64) uint64 {
 	return x
 }
 
+// pumpEnvForceMinOutOne — по умолчанию true: min_tokens_out=1 (макс. допустимое проскальзывание), обходит 6024 Overflow из-за завышенного min.
+// Отключить: PUMP_MIN_OUT_ONE=false
+func pumpEnvForceMinOutOne() bool {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("PUMP_MIN_OUT_ONE")))
+	if s == "false" || s == "0" || s == "no" {
+		return false
+	}
+	return true
+}
+
 // pumpComputeMinTokensOut — min_tokens для BuyExactSolIn по формуле IDL + запас под pfee GetFees vs Global.
 // Все величины — сырые атомы (как u64 в контракте), decimals минта учитываются только на уровне mint (обычно 6).
 func pumpComputeMinTokensOut(spendable, vSol, vToken, realToken, feeBps, creatorBps, slipBps uint64) (expectedOut, minOut uint64) {
@@ -214,11 +226,11 @@ func pumpComputeMinTokensOut(spendable, vSol, vToken, realToken, feeBps, creator
 	if realToken > 0 && expectedOut > realToken {
 		expectedOut = realToken
 	}
-	// +400 bps (~4%) к проскальзыванию: разница GetFees и полей Global
-	const pfeeSlipCushionBps uint64 = 400
+	// Запас под расхождение pfee GetFees и Global (чем выше, тем ниже min_out).
+	const pfeeSlipCushionBps uint64 = 2000
 	totalSlip := slipBps + pfeeSlipCushionBps
 	if totalSlip >= 9900 {
-		totalSlip = 9899 // min_out остаётся >= ~1.01% от expected
+		totalSlip = 9899
 	}
 	minOut = applySlippage(expectedOut, totalSlip)
 	if minOut == 0 && expectedOut > 0 {
@@ -393,11 +405,15 @@ func swapPumpFun(ctx context.Context, rpcClient *rpc.Client, wallet solana.Priva
 		spendableBudget, vSol, vTok, realToken, feeBps, creatorFeeBps, slippageBps,
 	)
 	minOut = pumpExtraHaircutMinOut(minOut, pumpMinOutExtraHaircutBps)
+	forceMinOne := pumpEnvForceMinOutOne()
+	if forceMinOne {
+		minOut = 1
+	}
 	if err := pumpValidateBuyQuote(expectedOut, minOut, realToken, mintDecimals); err != nil {
 		return solana.Signature{}, fmt.Errorf("pump buy quote: %w", err)
 	}
-	log.Printf("[PUMP] quote: spendable_budget_lamports=%d (base=%d +%d bps) expected_atoms=%d min_out_atoms=%d (incl. extra -%d bps) real_token_reserves=%d mint_decimals=%d slip_bps=%d",
-		spendableBudget, spendableLamports, pumpSpendableBufferBps, expectedOut, minOut, pumpMinOutExtraHaircutBps, realToken, mintDecimals, slippageBps)
+	log.Printf("[PUMP] quote: spendable_budget_lamports=%d (base=%d +%d bps) expected_atoms=%d min_out_atoms=%d (extra_haircut=%d bps, min_out_one=%v) real_token_reserves=%d mint_decimals=%d slip_bps=%d",
+		spendableBudget, spendableLamports, pumpSpendableBufferBps, expectedOut, minOut, pumpMinOutExtraHaircutBps, forceMinOne, realToken, mintDecimals, slippageBps)
 
 	assocBonding, _, err := solana.FindProgramAddress(
 		[][]byte{
