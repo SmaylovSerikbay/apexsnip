@@ -1059,6 +1059,37 @@ func logRejectedSocial(mintAddr, reason string, linkCount int, creatorSOL float6
 	}
 }
 
+// formatMintTerminal — короткий адрес для консоли (как в [SCAN]).
+func formatMintTerminal(mintAddr string) string {
+	m := strings.TrimSpace(mintAddr)
+	if m == "" {
+		return "(unknown)"
+	}
+	if len(m) > 44 {
+		return m[:18] + "…" + m[len(m)-10:]
+	}
+	return m
+}
+
+// logPumpCheckingLine — сводка по каждому новому Pump mint: соцсети Dex, % кривой on-chain, прошли ли фильтры (mint + ikeme).
+func logPumpCheckingLine(ctx context.Context, rpcClient *rpc.Client, mint solana.PublicKey, filtersPass bool) {
+	m := formatMintTerminal(mint.String())
+	socials := "No"
+	body, err := fetchDexscreenerTokenPairs(ctx, mint.String())
+	if err == nil && countTwitterTelegramLinks(&body, mint.String()) >= 1 {
+		socials = "Yes"
+	}
+	curve := "n/a"
+	if pct, err := ComputePumpBondingCurveSoldPct(ctx, rpcClient, mint); err == nil {
+		curve = fmt.Sprintf("%.2f%%", pct)
+	}
+	res := "Fail"
+	if filtersPass {
+		res = "Pass"
+	}
+	fmt.Printf("[CHECKING] Mint: %s | Socials: %s | Curve: %s | Result: %s\n", m, socials, curve, res)
+}
+
 // logPumpScanResult — одна короткая строка в консоль на каждый разобранный Pump.fun create (успех или отказ).
 // ok=false: reason — причина отказа; ok=true: reason — метка успеха (например "live buy", "simulation").
 func logPumpScanResult(mintAddr, sigStr string, ok bool, reason string) {
@@ -1312,14 +1343,15 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 	if len(mintStr) > 48 {
 		mintStr = mintStr[:36] + "…"
 	}
-	fmt.Printf("[SCAN] Checking mint: %s…\n", mintStr)
 
 	if ok, why := passesMintSecurity(ctx, rpcClient, mint, pumpDev, pumpMinCreatorLamports); !ok {
+		logPumpCheckingLine(ctx, rpcClient, mint, false)
 		logPumpScanResult(mint.String(), sigStr, false, "risk-check: "+why)
 		logRejected(mint.String(), fmt.Sprintf("[PUMP] risk-check: %s", why))
 		return
 	}
 	if ok, why := passesPumpIkemeRisk(ctx, rpcClient, mint); !ok {
+		logPumpCheckingLine(ctx, rpcClient, mint, false)
 		logPumpScanResult(mint.String(), sigStr, false, "ikeme-risk: "+why)
 		logRejected(mint.String(), fmt.Sprintf("[PUMP] ikeme-risk: %s", why))
 		return
@@ -1328,23 +1360,28 @@ func handlePumpCreateNotification(ctx context.Context, rpcClient *rpc.Client, wa
 	if IS_SIMULATION {
 		entry, err := fetchTokenPriceUSDFromAPIs(ctx, mint.String())
 		if err != nil {
+			logPumpCheckingLine(ctx, rpcClient, mint, true)
 			logPumpScanResult(mint.String(), sigStr, false, fmt.Sprintf("price API (sim): %v", err))
 			return
 		}
 		if !reportSimulationBuy(mint.String(), entry) {
+			logPumpCheckingLine(ctx, rpcClient, mint, true)
 			logPumpScanResult(mint.String(), sigStr, false, "sim: position not opened (no price / duplicate / limit / cash)")
 			return
 		}
+		logPumpCheckingLine(ctx, rpcClient, mint, true)
 		logPumpScanResult(mint.String(), sigStr, true, "simulation position opened")
 		startExitTracker(mint.String())
 		return
 	}
 	buySig, err := swapPumpFun(ctx, rpcClient, wallet, mint, BUY_LAMPORTS)
 	if err != nil {
+		logPumpCheckingLine(ctx, rpcClient, mint, true)
 		logPumpScanResult(mint.String(), sigStr, false, fmt.Sprintf("live swapPumpFun: %v", err))
 		log.Printf("[PUMP] live buy failed mint=%s: %v", mint.String(), err)
 		return
 	}
+	logPumpCheckingLine(ctx, rpcClient, mint, true)
 	logPumpScanResult(mint.String(), sigStr, true, "live buy submitted")
 	log.Printf("[PUMP] live BUY submitted | tx=%s | %s", buySig.String(), solscanTxURL(buySig.String()))
 	fmt.Printf("🟢 [PUMP] Live BUY | Solscan: %s\n", solscanTxURL(buySig.String()))

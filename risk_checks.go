@@ -53,15 +53,17 @@ func envIkemeInt(key string, def int) int {
 func ikemeEnabled() bool                         { return envIkemeBool("PUMP_IKEME_ENABLED", true) }
 func ikemeRequireTelegram() bool                 { return envIkemeBool("PUMP_IKEME_REQUIRE_TELEGRAM", false) }
 func ikemeDelayMinSec() int                      { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MIN", 2) }
-func ikemeDelayMaxSec() int                      { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MAX", 5) }
+func ikemeDelayMaxSec() int                      { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MAX", 2) }
 func ikemeMinVolumeUSD() float64               { return envIkemeFloat("PUMP_IKEME_MIN_VOLUME_USD", 0) }
 func ikemeMinTxEvents() int                    { return envIkemeInt("PUMP_IKEME_MIN_TX_EVENTS", 0) }
 func ikemeMaxNonCurveHolderPct() float64       { return envIkemeFloat("PUMP_IKEME_MAX_HOLDER_PCT", 30) }
-func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 2) }
+func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0.8) }
 func ikemeSkipVelocityWhenDexEmpty() bool       { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
 func ikemeSkipHoldersWhenLargestEmpty() bool     { return envIkemeBool("PUMP_IKEME_SKIP_HOLDERS_WHEN_LARGEST_EMPTY", true) }
+// При наличии Twitter/Telegram в Dex — не требовать min volume/tx (ранний вход до «разгона» объёма).
+func ikemeRelaxVelocityWhenSocialsPresent() bool { return envIkemeBool("PUMP_IKEME_RELAX_VELOCITY_WHEN_SOCIALS", true) }
 
-// pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2–5 с).
+// pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2 с; MIN–MAX из .env).
 func pumpRiskRandomDelay() {
 	minS, maxS := ikemeDelayMinSec(), ikemeDelayMaxSec()
 	if minS < 0 {
@@ -157,12 +159,17 @@ func dexPairVolumeAndTxActivity(body *dexscreenerTokenPairs, mint string) (volUS
 
 // passesPumpVelocityAndVolumeAfterDelay — вызывать после pumpRiskRandomDelay и свежего fetchDexscreenerTokenPairs.
 // У свежих монет Dex часто отдаёт volume=0 и tx=0 (лаг индексации) — при PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY=true такой кейс пропускается.
+// Если в Dex есть Twitter/Telegram — при PUMP_IKEME_RELAX_VELOCITY_WHEN_SOCIALS=true не ждём пороги min volume/tx (ранний вход).
 func passesPumpVelocityAndVolumeAfterDelay(body *dexscreenerTokenPairs, mint string) (bool, string) {
 	minVol := ikemeMinVolumeUSD()
 	minEv := ikemeMinTxEvents()
 	vol, ev, _ := dexPairVolumeAndTxActivity(body, mint)
 	if vol <= 0 && ev <= 0 {
 		log.Printf("[RISK] Skipping: No volume yet")
+	}
+	if ikemeRelaxVelocityWhenSocialsPresent() && countTwitterTelegramLinks(body, mint) >= 1 {
+		log.Printf("[RISK] velocity: есть Twitter/Telegram в Dex — пропуск порогов объёма/tx (не ждём крупный объём)")
+		return true, ""
 	}
 	if ikemeSkipVelocityWhenDexEmpty() && vol <= 0 && ev <= 0 {
 		log.Printf("[RISK] velocity: Dex volume/tx = 0 (часто лаг API) — пропуск порога; дальше проверки кривой/холдеров")
@@ -177,44 +184,52 @@ func passesPumpVelocityAndVolumeAfterDelay(body *dexscreenerTokenPairs, mint str
 	return true, ""
 }
 
-// passesPumpBondingCurveProgress — прогресс кривой: (initial_real - real_token) / initial_real >= minPct.
-// По умолчанию min 2% — отсекает монеты, куда кроме создателя почти никто не зашёл.
-// PUMP_IKEME_MIN_CURVE_PROGRESS_PCT <= 0 — проверка отключена.
-func passesPumpBondingCurveProgress(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
-	if ikemeMinBondingCurveProgressPct() <= 0 {
-		return true, ""
-	}
+// ComputePumpBondingCurveSoldPct — on-chain: доля проданного с кривой, % от initial_real_token_reserves (≈ прогресс bonding curve).
+func ComputePumpBondingCurveSoldPct(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (float64, error) {
 	gp, _, err := derivePumpGlobal()
 	if err != nil {
-		return false, fmt.Sprintf("curve progress: global PDA: %v", err)
+		return 0, fmt.Errorf("global PDA: %w", err)
 	}
 	gi, err := c.GetAccountInfoWithOpts(ctx, gp, &rpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: rpc.CommitmentProcessed})
 	if err != nil || gi == nil || gi.Value == nil || gi.Value.Data == nil {
-		return false, "curve progress: global account missing"
+		return 0, fmt.Errorf("global account missing")
 	}
 	gData := gi.Value.Data.GetBinary()
 	initialReal, err := parsePumpGlobalInitialRealTokenReserves(gData)
 	if err != nil || initialReal == 0 {
-		return false, "curve progress: cannot read initial_real_token_reserves"
+		return 0, fmt.Errorf("cannot read initial_real_token_reserves")
 	}
 	bc, _, err := derivePumpBondingCurve(mint)
 	if err != nil {
-		return false, fmt.Sprintf("curve progress: bonding curve PDA: %v", err)
+		return 0, fmt.Errorf("bonding curve PDA: %w", err)
 	}
 	bi, err := c.GetAccountInfoWithOpts(ctx, bc, &rpc.GetAccountInfoOpts{Encoding: solana.EncodingBase64, Commitment: rpc.CommitmentProcessed})
 	if err != nil || bi == nil || bi.Value == nil || bi.Value.Data == nil {
-		return false, "curve progress: bonding curve account missing"
+		return 0, fmt.Errorf("bonding curve account missing")
 	}
 	_, _, realTok, _, _, _, _, err := parsePumpBondingCurveData(bi.Value.Data.GetBinary())
 	if err != nil {
-		return false, fmt.Sprintf("curve progress: parse curve: %v", err)
+		return 0, fmt.Errorf("parse curve: %w", err)
 	}
 	if realTok > initialReal {
-		return true, ""
+		return 100, nil
 	}
 	sold := initialReal - realTok
-	pct := float64(sold) / float64(initialReal) * 100
+	return float64(sold) / float64(initialReal) * 100, nil
+}
+
+// passesPumpBondingCurveProgress — прогресс кривой: (initial_real - real_token) / initial_real >= minPct.
+// По умолчанию min 0.8% — раньше вход, чем «идеальная» кривая; 0 = выключить.
+// PUMP_IKEME_MIN_CURVE_PROGRESS_PCT <= 0 — проверка отключена.
+func passesPumpBondingCurveProgress(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
 	minPct := ikemeMinBondingCurveProgressPct()
+	if minPct <= 0 {
+		return true, ""
+	}
+	pct, err := ComputePumpBondingCurveSoldPct(ctx, c, mint)
+	if err != nil {
+		return false, fmt.Sprintf("curve progress: %v", err)
+	}
 	if pct < minPct {
 		return false, fmt.Sprintf("curve progress: %.2f%% < %.2f%% (sold/initial_real)", pct, minPct)
 	}
@@ -318,7 +333,11 @@ func passesPumpIkemeRisk(ctx context.Context, c *rpc.Client, mint solana.PublicK
 	if ok, why := passesPumpSocialsTelegram(&body, mintStr); !ok {
 		return false, why
 	}
-	log.Printf("[RISK] Pump %s: socials OK, waiting %d–%d s before volume/curve checks…", mintStr, ikemeDelayMinSec(), ikemeDelayMaxSec())
+	if ikemeDelayMinSec() == ikemeDelayMaxSec() {
+		log.Printf("[RISK] Pump %s: socials OK, waiting %d s before volume/curve checks…", mintStr, ikemeDelayMinSec())
+	} else {
+		log.Printf("[RISK] Pump %s: socials OK, waiting %d–%d s before volume/curve checks…", mintStr, ikemeDelayMinSec(), ikemeDelayMaxSec())
+	}
 	pumpRiskRandomDelay()
 	body2, err := fetchDexscreenerTokenPairs(ctx, mintStr)
 	if err != nil {
