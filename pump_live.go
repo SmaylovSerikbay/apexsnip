@@ -656,8 +656,8 @@ func monitorLivePumpOnce(ctx context.Context, rpcClient *rpc.Client, wallet sola
 
 	pnl := positionPnLPercent(entryUSD, price)
 
-	if pnl >= 100 && rem > 0 {
-		log.Printf("[LIVE PUMP] TAKE_PROFIT_2X %s pnl=%.2f%%", mintStr, pnl)
+	if pnl >= livePumpTakeProfitPnLPct && rem > 0 {
+		log.Printf("[LIVE PUMP] TAKE_PROFIT +%.0f%% target %s pnl=%.2f%%", livePumpTakeProfitPnLPct, mintStr, pnl)
 		if _, e := swapPumpFunSellAll(pctx, rpcClient, wallet, mintPK, slippageBps); e != nil {
 			log.Printf("[LIVE PUMP] TP sell failed: %v", e)
 		}
@@ -666,7 +666,7 @@ func monitorLivePumpOnce(ctx context.Context, rpcClient *rpc.Client, wallet sola
 	}
 
 	livePumpMu.Lock()
-	if p2 := livePumpOpenPositions[mintStr]; p2 != nil && !p2.TrailingArmed && pnl >= livePumpTrailingArmPnLPct && pnl < 100 {
+	if p2 := livePumpOpenPositions[mintStr]; p2 != nil && !p2.TrailingArmed && pnl >= livePumpTrailingArmPnLPct && pnl < livePumpTakeProfitPnLPct {
 		p2.TrailingArmed = true
 		if price > p2.HighWaterMark {
 			p2.HighWaterMark = price

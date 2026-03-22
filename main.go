@@ -110,9 +110,13 @@ const (
 	pricePollInterval    = 2 * time.Second
 	// targetSL для новых позиций: −35% от цены входа (до включения трейлинга).
 	targetStopLossMultiplier = 0.65
-	// Live Pump: трейлинг от пика после +20% PnL; откат от HWM — закрытие.
-	livePumpTrailingArmPnLPct       = 20.0
-	livePumpTrailingDrawdownFromHWM = 0.20 // 20% ниже пика
+)
+
+// Live Pump: выход — цель +200–300%% к PnL (дефолт +250%% полный выход), трейлинг только с «жирного» плюса, плотный откат от HWM (меньше слива).
+var (
+	livePumpTakeProfitPnLPct        = 250.0 // полный SELL при +250%% (≈3.5x от входа)
+	livePumpTrailingArmPnLPct       = 80.0  // трейлинг после +80%%; до этого только жёсткий SL −35%%
+	livePumpTrailingDrawdownFromHWM = 0.12  // 12%% ниже пика — фиксация без глубокого отката
 )
 
 // snipesLogFile — журнал сделок (BUY/SELL), без шума в консоли.
@@ -274,6 +278,21 @@ func applyTradingEnvFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("PUMP_MIN_CREATOR_LAMPORTS")); s != "" {
 		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
 			pumpMinCreatorLamports = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_LIVE_TP_PNL_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 50 && v <= 2000 {
+			livePumpTakeProfitPnLPct = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_LIVE_TRAILING_ARM_PNL_PCT")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v >= 0 && v < 500 {
+			livePumpTrailingArmPnLPct = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_LIVE_TRAILING_DRAWDOWN")); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0.02 && v < 0.45 {
+			livePumpTrailingDrawdownFromHWM = v
 		}
 	}
 }
@@ -2308,8 +2327,7 @@ func positionPnLPercent(entry, price float64) float64 {
 	return (price/entry - 1) * 100
 }
 
-// monitorPosition — симуляция: TP +100% (полный выход), без выхода по времени.
-// До +20% PnL — только стоп −35%; после +20% — трейлинг от пика (−20% от HWM).
+// monitorPosition — симуляция: TP по PUMP_LIVE_TP_PNL_PCT (дефолт +250%), трейлинг после PUMP_LIVE_TRAILING_ARM_PNL_PCT, откат PUMP_LIVE_TRAILING_DRAWDOWN от HWM.
 func monitorPosition(mint string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
@@ -2342,13 +2360,13 @@ func monitorPosition(mint string) bool {
 	p := price
 	pnl := positionPnLPercent(entryUSD, p)
 
-	if pnl >= 100 && remaining > 0 {
-		reportSimulationSell(mint, "TAKE_PROFIT_2X", entryUSD, p, remaining)
+	if pnl >= livePumpTakeProfitPnLPct && remaining > 0 {
+		reportSimulationSell(mint, "TAKE_PROFIT_TARGET", entryUSD, p, remaining)
 		return true
 	}
 
 	simMu.Lock()
-	if pos2 := simOpenPositions[mint]; pos2 != nil && !pos2.TrailingArmed && pnl >= livePumpTrailingArmPnLPct && pnl < 100 {
+	if pos2 := simOpenPositions[mint]; pos2 != nil && !pos2.TrailingArmed && pnl >= livePumpTrailingArmPnLPct && pnl < livePumpTakeProfitPnLPct {
 		pos2.TrailingArmed = true
 		if p > pos2.HighWaterMark {
 			pos2.HighWaterMark = p

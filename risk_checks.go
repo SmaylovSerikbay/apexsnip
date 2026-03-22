@@ -54,8 +54,9 @@ func envIkemeInt(key string, def int) int {
 
 func ikemeEnabled() bool                         { return envIkemeBool("PUMP_IKEME_ENABLED", true) }
 func ikemeRequireTelegram() bool                 { return envIkemeBool("PUMP_IKEME_REQUIRE_TELEGRAM", false) }
-func ikemeDelayMinSec() int                      { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MIN", 2) }
-func ikemeDelayMaxSec() int                      { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MAX", 2) }
+// Ранний вход: по умолчанию 0 с перед повторным Dex (раньше 2 с — цена уезжала на сотни %).
+func ikemeDelayMinSec() int { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MIN", 0) }
+func ikemeDelayMaxSec() int { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MAX", 0) }
 func ikemeMinVolumeUSD() float64               { return envIkemeFloat("PUMP_IKEME_MIN_VOLUME_USD", 0) }
 func ikemeMinTxEvents() int                    { return envIkemeInt("PUMP_IKEME_MIN_TX_EVENTS", 0) }
 func ikemeMaxNonCurveHolderPct() float64       { return envIkemeFloat("PUMP_IKEME_MAX_HOLDER_PCT", 30) }
@@ -65,18 +66,18 @@ func ikemeSkipVelocityWhenDexEmpty() bool { return envIkemeBool("PUMP_IKEME_SKIP
 // При наличии Twitter/Telegram в Dex — не требовать min volume/tx (ранний вход до «разгона» объёма).
 func ikemeRelaxVelocityWhenSocialsPresent() bool { return envIkemeBool("PUMP_IKEME_RELAX_VELOCITY_WHEN_SOCIALS", true) }
 
-// Пауза перед getTokenLargestAccounts (мс), чтобы RPC/индекс успели увидеть ATA. 0 = без паузы.
+// Пауза перед getTokenLargestAccounts (мс). По умолчанию 0 — ранний вход; при лаге RPC поднять (напр. 500–1000).
 func ikemeHoldersPreDelay() time.Duration {
-	ms := envIkemeInt("PUMP_IKEME_HOLDERS_PRE_DELAY_MS", 1000)
+	ms := envIkemeInt("PUMP_IKEME_HOLDERS_PRE_DELAY_MS", 0)
 	if ms <= 0 {
 		return 0
 	}
 	return time.Duration(ms) * time.Millisecond
 }
 
-// Пауза между попытками getTokenLargestAccounts (мс). По умолчанию 1000 вместо 500.
+// Пауза между попытками getTokenLargestAccounts (мс). По умолчанию 250 — быстрее, чем 1000.
 func ikemeHoldersRetryPause() time.Duration {
-	ms := envIkemeInt("PUMP_IKEME_HOLDERS_RETRY_PAUSE_MS", 1000)
+	ms := envIkemeInt("PUMP_IKEME_HOLDERS_RETRY_PAUSE_MS", 250)
 	if ms <= 0 {
 		return 0
 	}
@@ -89,7 +90,19 @@ func ikemeHoldersHypePassCurvePct() float64 {
 	return envIkemeFloat("PUMP_IKEME_HOLDERS_HYPE_PASS_CURVE_PCT", 5)
 }
 
-// pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2 с; MIN–MAX из .env).
+// Доп. попытки getTokenLargestAccounts после первой (всего 1 + N). По умолчанию 1 (раньше 3 → до 4 RPC подряд).
+func ikemeHoldersExtraRetries() int {
+	n := envIkemeInt("PUMP_IKEME_HOLDERS_EXTRA_RETRIES", 1)
+	if n < 0 {
+		return 0
+	}
+	if n > 5 {
+		return 5
+	}
+	return n
+}
+
+// pumpRiskRandomDelay — пауза перед повторной проверкой Dex (MIN–MAX из .env; 0 = без ожидания).
 func pumpRiskRandomDelay() {
 	minS, maxS := ikemeDelayMinSec(), ikemeDelayMaxSec()
 	if minS < 0 {
@@ -360,7 +373,7 @@ func largestTokenAccountsViaProgramAccounts(ctx context.Context, c *rpc.Client, 
 
 // getTokenLargestAccountsPump — getTokenLargestAccounts + ретраи; при -32602 «not a Token mint» — fallback для Token-2022 (Pump.fun).
 func getTokenLargestAccountsPump(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (*rpc.GetTokenLargestAccountsResult, error) {
-	const extraRetries = 3
+	extraRetries := ikemeHoldersExtraRetries()
 	pause := ikemeHoldersRetryPause()
 	var last *rpc.GetTokenLargestAccountsResult
 	var lastErr error
@@ -493,7 +506,9 @@ func passesPumpIkemeRisk(ctx context.Context, c *rpc.Client, mint solana.PublicK
 	if ok, why := passesPumpSocialsTelegram(&body, mintStr); !ok {
 		return false, why
 	}
-	if ikemeDelayMinSec() == ikemeDelayMaxSec() {
+	if ikemeDelayMinSec() == 0 && ikemeDelayMaxSec() == 0 {
+		log.Printf("[RISK] Pump %s: socials OK — без паузы перед volume/curve (ранний вход)", mintStr)
+	} else if ikemeDelayMinSec() == ikemeDelayMaxSec() {
 		log.Printf("[RISK] Pump %s: socials OK, waiting %d s before volume/curve checks…", mintStr, ikemeDelayMinSec())
 	} else {
 		log.Printf("[RISK] Pump %s: socials OK, waiting %d–%d s before volume/curve checks…", mintStr, ikemeDelayMinSec(), ikemeDelayMaxSec())
