@@ -103,6 +103,15 @@ func parsePumpBondingCurveData(data []byte) (virtualToken, virtualSol, realToken
 	return virtualToken, virtualSol, realToken, realSol, tokenTotal, complete, creator, nil
 }
 
+// pumpCreatorForVault — PDA creator-vault: доверяем pubkey из create (pumpDev), иначе из аккаунта кривой.
+func pumpCreatorForVault(trusted, fromCurve solana.PublicKey) solana.PublicKey {
+	var zero solana.PublicKey
+	if !trusted.Equals(zero) {
+		return trusted
+	}
+	return fromCurve
+}
+
 // parsePumpGlobalFees — fee_recipient + fee_basis_points + creator_fee_basis_points (Anchor Global layout).
 func parsePumpGlobalFees(data []byte) (feeRecipient solana.PublicKey, feeBps, creatorFeeBps uint64, err error) {
 	if len(data) < 170 {
@@ -348,7 +357,8 @@ func mintTokenProgram(ctx context.Context, c *rpc.Client, mint solana.PublicKey)
 }
 
 // swapPumpFun покупка на bonding curve: spendable_lamports = BUY_LAMPORTS, min_tokens из slippageBps.
-func swapPumpFun(ctx context.Context, rpcClient *rpc.Client, wallet solana.PrivateKey, mint solana.PublicKey, spendableLamports uint64) (solana.Signature, error) {
+// creatorTrusted — pubkey создателя из Pump create (accounts[7]); обязателен для корректного creator_vault (иначе 6024 Overflow при неверном парсинге curve).
+func swapPumpFun(ctx context.Context, rpcClient *rpc.Client, wallet solana.PrivateKey, mint solana.PublicKey, spendableLamports uint64, creatorTrusted solana.PublicKey) (solana.Signature, error) {
 	owner := wallet.PublicKey()
 
 	tokenProgram, err := mintTokenProgram(ctx, rpcClient, mint)
@@ -393,12 +403,16 @@ func swapPumpFun(ctx context.Context, rpcClient *rpc.Client, wallet solana.Priva
 		return solana.Signature{}, fmt.Errorf("bonding curve account missing")
 	}
 	bcData := bcInfo.Value.Data.GetBinary()
-	vTok, vSol, realToken, _, _, complete, creator, err := parsePumpBondingCurveData(bcData)
+	vTok, vSol, realToken, _, _, complete, creatorFromCurve, err := parsePumpBondingCurveData(bcData)
 	if err != nil {
 		return solana.Signature{}, err
 	}
 	if complete {
 		return solana.Signature{}, fmt.Errorf("bonding curve complete (migrated)")
+	}
+	creator := pumpCreatorForVault(creatorTrusted, creatorFromCurve)
+	if !creatorTrusted.Equals(solana.PublicKey{}) && !creatorTrusted.Equals(creatorFromCurve) {
+		log.Printf("[PUMP] creator_vault: using create-tx creator (curve parse differed: trusted=%s curve=%s)", creatorTrusted.String(), creatorFromCurve.String())
 	}
 
 	expectedOut, minOut := pumpComputeMinTokensOut(
