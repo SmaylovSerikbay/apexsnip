@@ -57,8 +57,9 @@ func ikemeDelayMaxSec() int                      { return envIkemeInt("PUMP_IKEM
 func ikemeMinVolumeUSD() float64               { return envIkemeFloat("PUMP_IKEME_MIN_VOLUME_USD", 0) }
 func ikemeMinTxEvents() int                    { return envIkemeInt("PUMP_IKEME_MIN_TX_EVENTS", 0) }
 func ikemeMaxNonCurveHolderPct() float64       { return envIkemeFloat("PUMP_IKEME_MAX_HOLDER_PCT", 30) }
-func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0) }
-func ikemeSkipVelocityWhenDexEmpty() bool      { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
+func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 2) }
+func ikemeSkipVelocityWhenDexEmpty() bool       { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
+func ikemeSkipHoldersWhenLargestEmpty() bool     { return envIkemeBool("PUMP_IKEME_SKIP_HOLDERS_WHEN_LARGEST_EMPTY", true) }
 
 // pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2–5 с).
 func pumpRiskRandomDelay() {
@@ -160,6 +161,9 @@ func passesPumpVelocityAndVolumeAfterDelay(body *dexscreenerTokenPairs, mint str
 	minVol := ikemeMinVolumeUSD()
 	minEv := ikemeMinTxEvents()
 	vol, ev, _ := dexPairVolumeAndTxActivity(body, mint)
+	if vol <= 0 && ev <= 0 {
+		log.Printf("[RISK] Skipping: No volume yet")
+	}
 	if ikemeSkipVelocityWhenDexEmpty() && vol <= 0 && ev <= 0 {
 		log.Printf("[RISK] velocity: Dex volume/tx = 0 (часто лаг API) — пропуск порога; дальше проверки кривой/холдеров")
 		return true, ""
@@ -174,7 +178,8 @@ func passesPumpVelocityAndVolumeAfterDelay(body *dexscreenerTokenPairs, mint str
 }
 
 // passesPumpBondingCurveProgress — прогресс кривой: (initial_real - real_token) / initial_real >= minPct.
-// PUMP_IKEME_MIN_CURVE_PROGRESS_PCT <= 0 — проверка отключена (ранний вход ~0.2–0.4% иначе режется).
+// По умолчанию min 2% — отсекает монеты, куда кроме создателя почти никто не зашёл.
+// PUMP_IKEME_MIN_CURVE_PROGRESS_PCT <= 0 — проверка отключена.
 func passesPumpBondingCurveProgress(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
 	if ikemeMinBondingCurveProgressPct() <= 0 {
 		return true, ""
@@ -216,6 +221,32 @@ func passesPumpBondingCurveProgress(ctx context.Context, c *rpc.Client, mint sol
 	return true, ""
 }
 
+// getTokenLargestAccountsPump — до 4 попыток (1 + 3 ретрая по 500 ms), пока RPC не отдаст список или не исчерпаем попытки.
+func getTokenLargestAccountsPump(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (*rpc.GetTokenLargestAccountsResult, error) {
+	const extraRetries = 3
+	const pause = 500 * time.Millisecond
+	var last *rpc.GetTokenLargestAccountsResult
+	var lastErr error
+	for attempt := 0; attempt <= extraRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(pause)
+		}
+		out, err := c.GetTokenLargestAccounts(ctx, mint, rpc.CommitmentProcessed)
+		last, lastErr = out, err
+		ok := err == nil && out != nil && len(out.Value) > 0
+		if ok {
+			if attempt > 0 {
+				log.Printf("[RISK] holders: getTokenLargestAccounts успех после %d ретраев", attempt)
+			}
+			return out, nil
+		}
+		if attempt < extraRetries {
+			log.Printf("[RISK] holders: getTokenLargestAccounts пусто/ошибка (попытка %d/%d): %v — повтор через %v…", attempt+1, extraRetries+1, err, pause)
+		}
+	}
+	return last, lastErr
+}
+
 // passesPumpTopHolderConcentration — кроме ATA bonding curve ни один из крупнейших кошельков не держит > maxPct сапплая.
 func passesPumpTopHolderConcentration(ctx context.Context, c *rpc.Client, mint solana.PublicKey) (bool, string) {
 	sup, err := c.GetTokenSupply(ctx, mint, rpc.CommitmentProcessed)
@@ -241,7 +272,11 @@ func passesPumpTopHolderConcentration(ctx context.Context, c *rpc.Client, mint s
 	if err != nil {
 		return false, fmt.Sprintf("holders: assoc BC: %v", err)
 	}
-	largest, err := c.GetTokenLargestAccounts(ctx, mint, rpc.CommitmentProcessed)
+	largest, err := getTokenLargestAccountsPump(ctx, c, mint)
+	if ikemeSkipHoldersWhenLargestEmpty() && (err != nil || largest == nil || len(largest.Value) == 0) {
+		log.Printf("[RISK] holders: getTokenLargestAccounts пусто/ошибка (часто на свежем минте) — пропуск проверки: %v", err)
+		return true, ""
+	}
 	if err != nil || largest == nil || len(largest.Value) == 0 {
 		return false, "holders: getTokenLargestAccounts empty"
 	}
