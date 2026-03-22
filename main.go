@@ -94,10 +94,10 @@ const (
 // BUY_LAMPORTS — размер «покупки» в лампортах (0.05 SOL по умолчанию).
 const BUY_LAMPORTS uint64 = 50_000_000
 
-// slippageBps / priorityFeeLamports — для live: дефолт 25% (лимит min_out на чейне) и ~0.001 SOL; переопределяются SLIPPAGE_BPS и PRIORITY_FEE_LAMPORTS в .env.
+// slippageBps / priorityFeeLamports — для live: дефолт 40% и 0.003 SOL; переопределяются SLIPPAGE_BPS и PRIORITY_FEE_LAMPORTS в .env.
 var (
-	slippageBps         uint64 = 2500 // 25% = 2500 bps (не «потеря 25%», а допустимое проскальзывание min_out)
-	priorityFeeLamports uint64 = 1_000_000
+	slippageBps         uint64 = 4000 // 40% = 4000 bps (лимит min_out, не фактическая потеря)
+	priorityFeeLamports uint64 = 3_000_000 // 0.003 SOL
 )
 
 // MinMicroLamportsPerCU — нижняя граница цены за CU (рекомендация валидаторов / конкуренция в мемпуле).
