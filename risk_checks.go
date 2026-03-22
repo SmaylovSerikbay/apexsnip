@@ -54,10 +54,11 @@ func ikemeEnabled() bool                         { return envIkemeBool("PUMP_IKE
 func ikemeRequireTelegram() bool                 { return envIkemeBool("PUMP_IKEME_REQUIRE_TELEGRAM", false) }
 func ikemeDelayMinSec() int                      { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MIN", 2) }
 func ikemeDelayMaxSec() int                      { return envIkemeInt("PUMP_IKEME_DELAY_SEC_MAX", 5) }
-func ikemeMinVolumeUSD() float64                 { return envIkemeFloat("PUMP_IKEME_MIN_VOLUME_USD", 50) }
-func ikemeMinTxEvents() int                      { return envIkemeInt("PUMP_IKEME_MIN_TX_EVENTS", 3) }
-func ikemeMaxNonCurveHolderPct() float64         { return envIkemeFloat("PUMP_IKEME_MAX_HOLDER_PCT", 30) }
-func ikemeMinBondingCurveProgressPct() float64   { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0.5) }
+func ikemeMinVolumeUSD() float64               { return envIkemeFloat("PUMP_IKEME_MIN_VOLUME_USD", 0) }
+func ikemeMinTxEvents() int                    { return envIkemeInt("PUMP_IKEME_MIN_TX_EVENTS", 0) }
+func ikemeMaxNonCurveHolderPct() float64       { return envIkemeFloat("PUMP_IKEME_MAX_HOLDER_PCT", 30) }
+func ikemeMinBondingCurveProgressPct() float64 { return envIkemeFloat("PUMP_IKEME_MIN_CURVE_PROGRESS_PCT", 0.5) }
+func ikemeSkipVelocityWhenDexEmpty() bool      { return envIkemeBool("PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY", true) }
 
 // pumpRiskRandomDelay — пауза перед повторной проверкой Dex (по умолчанию 2–5 с).
 func pumpRiskRandomDelay() {
@@ -154,14 +155,19 @@ func dexPairVolumeAndTxActivity(body *dexscreenerTokenPairs, mint string) (volUS
 }
 
 // passesPumpVelocityAndVolumeAfterDelay — вызывать после pumpRiskRandomDelay и свежего fetchDexscreenerTokenPairs.
+// У свежих монет Dex часто отдаёт volume=0 и tx=0 (лаг индексации) — при PUMP_IKEME_SKIP_VELOCITY_WHEN_DEX_EMPTY=true такой кейс пропускается.
 func passesPumpVelocityAndVolumeAfterDelay(body *dexscreenerTokenPairs, mint string) (bool, string) {
 	minVol := ikemeMinVolumeUSD()
 	minEv := ikemeMinTxEvents()
 	vol, ev, _ := dexPairVolumeAndTxActivity(body, mint)
-	if vol < minVol {
+	if ikemeSkipVelocityWhenDexEmpty() && vol <= 0 && ev <= 0 {
+		log.Printf("[RISK] velocity: Dex volume/tx = 0 (часто лаг API) — пропуск порога; дальше проверки кривой/холдеров")
+		return true, ""
+	}
+	if minVol > 0 && vol < minVol {
 		return false, fmt.Sprintf("velocity: volume_usd_max_window=%.2f < %.0f", vol, minVol)
 	}
-	if ev < minEv {
+	if minEv > 0 && ev < minEv {
 		return false, fmt.Sprintf("velocity: tx_events_max(m5,h1)=%d < %d", ev, minEv)
 	}
 	return true, ""

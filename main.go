@@ -75,14 +75,11 @@ const (
 	simStalePriceExitDuration = 5 * time.Minute
 )
 
-// Pump create (IDL): минимум SOL у создателя — зависит от соцссылок (Dexscreener).
-const (
-	pumpCreateUserAccountIndex = 7 // accounts[7] = user (signer)
-	// Без соцссылок (links=0): жёсткий порог.
-	pumpMinCreatorLamports = uint64(20_000_000) // 0.02 SOL
-	// При ≥1 соцссылке (twitter/telegram в Dexscreener): мягче.
-	pumpMinCreatorLamportsWithSocial = uint64(10_000_000) // 0.01 SOL
-)
+const pumpCreateUserAccountIndex = 7 // accounts[7] = user (signer)
+
+// pumpMinCreatorLamports — минимум SOL на кошельке создателя Pump create; по умолчанию 0.01 SOL (часто <0.02 после комиссий).
+// Переопределение: PUMP_MIN_CREATOR_LAMPORTS в .env (лампорты).
+var pumpMinCreatorLamports uint64 = 10_000_000
 
 // ANSI для зелёного баннера [TRADING] в терминале.
 const (
@@ -262,7 +259,7 @@ func loadDotEnv() {
 	}
 }
 
-// applyTradingEnvFromEnv — SLIPPAGE_BPS (50–5000), PRIORITY_FEE_LAMPORTS (мин. 5000 lamports).
+// applyTradingEnvFromEnv — SLIPPAGE_BPS (50–5000), PRIORITY_FEE_LAMPORTS (мин. 5000 lamports), PUMP_MIN_CREATOR_LAMPORTS.
 func applyTradingEnvFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("SLIPPAGE_BPS")); s != "" {
 		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v >= 50 && v <= 5000 {
@@ -272,6 +269,11 @@ func applyTradingEnvFromEnv() {
 	if s := strings.TrimSpace(os.Getenv("PRIORITY_FEE_LAMPORTS")); s != "" {
 		if v, err := strconv.ParseUint(s, 10, 64); err == nil && v >= 5_000 {
 			priorityFeeLamports = v
+		}
+	}
+	if s := strings.TrimSpace(os.Getenv("PUMP_MIN_CREATOR_LAMPORTS")); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+			pumpMinCreatorLamports = v
 		}
 	}
 }
@@ -1641,7 +1643,7 @@ func pickNonBaseQuoteMint(coin, pc solana.PublicKey) solana.PublicKey {
 
 // passesMintSecurity — mint authority/freeze + опционально минимум SOL у pumpDev (создатель Pump create).
 // pumpDev = zero pubkey → проверка создателя не выполняется (Raydium / CPMM).
-// pumpCreatorMinLamports: для Pump; при 0 подставляется pumpMinCreatorLamports (0.02 SOL).
+// pumpCreatorMinLamports: для Pump; при 0 подставляется pumpMinCreatorLamports (см. .env PUMP_MIN_CREATOR_LAMPORTS).
 // Новые mint: GetAccountInfo с commitment=processed, 10×500ms ≈ 5s ожидания индексации.
 func passesMintSecurity(ctx context.Context, c *rpc.Client, mint solana.PublicKey, pumpDev solana.PublicKey, pumpCreatorMinLamports uint64) (bool, string) {
 	var zero solana.PublicKey
