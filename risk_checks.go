@@ -91,9 +91,19 @@ func ikemeHoldersRetryPause() time.Duration {
 }
 
 // Если getProgramAccounts вернул «слишком много аккаунтов», пропускаем концентрацию холдеров при curve ≥ этого % (хайп / много мелких ATA).
+// Дефолт 1.0 (не 5): у свежего минта кривая часто 1–3%% — при 5%% почти все сделки отсекались.
 func ikemeHoldersHypePassCurvePct() float64 {
-	// При Too many accounts: пропуск холдеров если curve ≥ N% (ниже = больше сделок при RPC-лимите).
-	return envIkemeFloat("PUMP_IKEME_HOLDERS_HYPE_PASS_CURVE_PCT", 5)
+	return envIkemeFloat("PUMP_IKEME_HOLDERS_HYPE_PASS_CURVE_PCT", 1.0)
+}
+
+// Доп. нижняя планка: при Too many accounts и curve ≥ floor (но < hype) — тоже пропуск (ещё более ранние минты).
+// 0 = выключить. Дефолт 0.3 — пропуск при curve ≥ 0.3%% если не прошли порог hype.
+func ikemeHoldersHypeFloorCurvePct() float64 {
+	v := envIkemeFloat("PUMP_IKEME_HOLDERS_HYPE_FLOOR_PCT", 0.3)
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 // Доп. попытки getTokenLargestAccounts после первой (всего 1 + N). По умолчанию 1 (раньше 3 → до 4 RPC подряд).
@@ -483,10 +493,15 @@ func passesPumpTopHolderConcentration(ctx context.Context, c *rpc.Client, mint s
 			}
 			minHype := ikemeHoldersHypePassCurvePct()
 			if pct >= minHype {
-				log.Printf("[RISK] holders: слишком много ATA по RPC (хайп) — пропуск проверки концентрации при curve %.2f%% ≥ %.1f%%", pct, minHype)
+				log.Printf("[RISK] holders: слишком много ATA по RPC (хайп) — пропуск проверки концентрации при curve %.2f%% ≥ %.2f%%", pct, minHype)
 				return true, ""
 			}
-			return false, fmt.Sprintf("holders: too many accounts (RPC), curve %.2f%% < %.1f%% (нужен порог для хайпа)", pct, minHype)
+			floor := ikemeHoldersHypeFloorCurvePct()
+			if floor > 0 && pct >= floor {
+				log.Printf("[RISK] holders: слишком много ATA — пропуск по floor curve %.2f%% ≥ %.2f%% (ранний минт, PUMP_IKEME_HOLDERS_HYPE_FLOOR_PCT)", pct, floor)
+				return true, ""
+			}
+			return false, fmt.Sprintf("holders: too many accounts (RPC), curve %.2f%% < floor %.2f%% / hype %.2f%%", pct, floor, minHype)
 		}
 		return false, "holders: " + friendlyHolderRPCError(err)
 	}
